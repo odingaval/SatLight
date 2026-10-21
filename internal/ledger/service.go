@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -16,13 +18,14 @@ var (
 
 type Service struct {
 	pool *pgxpool.Pool
-	log  *zerolog.Logger
+	log  zerolog.Logger
 }
 
 func NewService(cfg interface{}, pool *pgxpool.Pool) *Service {
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}).With().Timestamp().Logger()
 	return &Service{
 		pool: pool,
-		log:  zerolog.New(zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}}}, TimeFormat: zerolog.TimeFormatUnix}).With().Timestamp().Logger(),
+		log:  logger,
 	}
 }
 
