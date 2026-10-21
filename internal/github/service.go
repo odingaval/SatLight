@@ -9,10 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
+	"github.com/gin-gonic/gin"
 	"github.com/google/go-github/v60/github"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -31,7 +31,7 @@ type Service struct {
 	cfg    *Config
 	pool   *pgxpool.Pool
 	client *github.Client
-	log    *zerolog.Logger
+	log    zerolog.Logger
 }
 
 type Config struct {
@@ -44,19 +44,15 @@ type Config struct {
 
 func NewService(cfg interface{}, pool *pgxpool.Pool) *Service {
 	c := cfg.(*Config)
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}).With().Timestamp().Logger()
 	return &Service{
 		cfg:  c,
 		pool: pool,
-		log:  zerolog.New(zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}}}, TimeFormat: zerolog.TimeFormatUnix}).With().Timestamp().Logger(),
+		log:  logger,
 	}
 }
 
 func (s *Service) Connect(ctx context.Context) error {
-	keyData, err := os.ReadFile(s.cfg.PrivateKeyPath)
-	if err != nil {
-		return err
-	}
-
 	itr, err := ghinstallation.NewKeyFromFile(http.DefaultTransport, s.cfg.AppID, 0, s.cfg.PrivateKeyPath)
 	if err != nil {
 		return err
@@ -139,12 +135,12 @@ func (s *Service) ProcessWebhook(ctx context.Context, deliveryID, event string, 
 }
 
 func (s *Service) handlePullRequestEvent(ctx context.Context, tx pgx.Tx, event github.PullRequestEvent) error {
-	if event.GetAction() != "closed" || event.GetPullRequest().GetMergedAt() == nil {
+	if event.GetAction() != "closed" || event.PullRequest == nil || event.PullRequest.MergedAt == nil {
 		return nil
 	}
 
-	pr := event.GetPullRequest()
-	repo := event.GetRepo()
+	pr := event.PullRequest
+	repo := event.Repo
 
 	body := pr.GetBody()
 	issueNum := extractIssueNumber(body)
@@ -168,15 +164,16 @@ func (s *Service) handlePullRequestEvent(ctx context.Context, tx pgx.Tx, event g
 		return nil
 	}
 
-	if pr.GetUser().GetID() != getClaimUserID(ctx, tx, claimID) {
+	if pr.User.GetID() != getClaimUserID(ctx, tx, claimID) {
 		return ErrPRNotLinked
 	}
 
+	mergedAt := pr.GetMergedAt().Time
 	_, err = tx.Exec(ctx, `
 		INSERT INTO pull_requests (claim_id, github_pr_number, author_github_id, head_sha, merged, merged_at, merge_commit_sha)
 		VALUES ($1, $2, $3, $4, true, $5, $6)
 		ON CONFLICT (claim_id, github_pr_number) DO UPDATE SET merged = true, merged_at = $5, merge_commit_sha = $6
-	`, claimID, pr.GetNumber(), pr.GetUser().GetID(), pr.GetHead().GetSHA(), pr.GetMergedAt().Time, pr.GetMergeCommitSHA())
+	`, claimID, pr.GetNumber(), pr.User.GetID(), pr.Head.GetSHA(), mergedAt, pr.GetMergeCommitSHA())
 	if err != nil {
 		return err
 	}
@@ -222,12 +219,9 @@ func (s *Service) VerifyRepoAdmin(ctx context.Context, installationID int64, use
 		return false, errors.New("invalid repo format")
 	}
 
-	collaborator, _, err := client.Repositories.CheckCollaborator(ctx, parts[0], parts[1], "")
+	_, _, err = client.Repositories.Get(ctx, parts[0], parts[1])
 	if err != nil {
 		return false, err
-	}
-	if !collaborator {
-		return false, nil
 	}
 
 	perm, _, err := client.Repositories.GetPermissionLevel(ctx, parts[0], parts[1], "")
@@ -237,11 +231,16 @@ func (s *Service) VerifyRepoAdmin(ctx context.Context, installationID int64, use
 	return perm.GetPermission() == "admin", nil
 }
 
+var oauth2Endpoint = oauth2.Endpoint{
+	AuthURL:  "https://github.com/login/oauth/authorize",
+	TokenURL: "https://github.com/login/oauth/access_token",
+}
+
 func (s *Service) GetOAuthURL(state string) string {
 	config := &oauth2.Config{
 		ClientID:     s.cfg.OAuthClientID,
 		ClientSecret: s.cfg.OAuthClientSecret,
-		Endpoint:     github.Endpoint,
+		Endpoint:     oauth2Endpoint,
 		RedirectURL:  "",
 		Scopes:       []string{"read:user", "user:email"},
 	}
@@ -252,7 +251,7 @@ func (s *Service) ExchangeCode(ctx context.Context, code string) (*oauth2.Token,
 	config := &oauth2.Config{
 		ClientID:     s.cfg.OAuthClientID,
 		ClientSecret: s.cfg.OAuthClientSecret,
-		Endpoint:     github.Endpoint,
+		Endpoint:     oauth2Endpoint,
 	}
 	return config.Exchange(ctx, code)
 }
