@@ -6,8 +6,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/riverqueue/river"
 	"github.com/rs/zerolog"
 	"github.com/satlight/satlight/internal/config"
 	"github.com/satlight/satlight/internal/ledger"
@@ -15,27 +16,28 @@ import (
 )
 
 var (
-	ErrBountyNotFound      = errors.New("bounty not found")
-	ErrBountyNotOpen       = errors.New("bounty is not open for claims")
+	ErrBountyNotFound       = errors.New("bounty not found")
+	ErrBountyNotOpen        = errors.New("bounty is not open for claims")
 	ErrBountyAlreadyClaimed = errors.New("bounty already claimed")
-	ErrInsufficientFunds   = errors.New("insufficient wallet balance")
-	ErrInvalidState        = errors.New("invalid bounty state for this operation")
-	ErrNotAuthorized       = errors.New("not authorized")
+	ErrInsufficientFunds    = errors.New("insufficient wallet balance")
+	ErrInvalidState         = errors.New("invalid bounty state for this operation")
+	ErrNotAuthorized        = errors.New("not authorized")
 )
 
 type Service struct {
 	cfg    *config.Config
 	pool   *pgxpool.Pool
-	log    *zerolog.Logger
+	log    zerolog.Logger
 	ledger *ledger.Service
 	queue  *queue.Client
 }
 
 func NewService(cfg *config.Config, pool *pgxpool.Pool) *Service {
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}).With().Timestamp().Logger()
 	return &Service{
 		cfg:    cfg,
 		pool:   pool,
-		log:    zerolog.New(zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}}}, TimeFormat: zerolog.TimeFormatUnix}).With().Timestamp().Logger(),
+		log:    logger,
 		ledger: nil,
 		queue:  nil,
 	}
@@ -338,7 +340,7 @@ func (s *Service) ClaimBounty(ctx context.Context, bountyID, userID int64) (*Cla
 	}
 
 	if s.queue != nil {
-		s.queue.Insert(ctx, &queue.ClaimExpiryArgs{ClaimID: claim.ID}, &queue.InsertOpts{ScheduledAt: expiresAt})
+		s.queue.Insert(ctx, &queue.ClaimExpiryArgs{ClaimID: claim.ID}, river.InsertOpts{ScheduledAt: expiresAt})
 	}
 
 	return &claim, nil
@@ -425,4 +427,98 @@ func (s *Service) DisputeBounty(ctx context.Context, bountyID, userID int64, rea
 		VALUES ($1, $2, $3, $4)
 	`, bountyID, userID, reason, evidence)
 	return err
+}
+
+func (s *Service) GetBountyWithProject(ctx context.Context, bountyID int64) (*Bounty, *Project, error) {
+	var bounty Bounty
+	var project Project
+	err := s.pool.QueryRow(ctx, `
+		SELECT b.id, b.project_id, b.github_issue_number, b.title, b.description, b.difficulty, b.reward_sats, b.fee_sats, b.state, b.expires_at, b.created_at,
+		       p.id, p.owner_user_id, p.github_installation_id, p.repo_full_name, p.status, p.created_at
+		FROM bounties b
+		JOIN projects p ON b.project_id = p.id
+		WHERE b.id = $1
+	`, bountyID).Scan(
+		&bounty.ID, &bounty.ProjectID, &bounty.GitHubIssueNumber, &bounty.Title, &bounty.Description,
+		&bounty.Difficulty, &bounty.RewardSats, &bounty.FeeSats, &bounty.State, &bounty.ExpiresAt, &bounty.CreatedAt,
+		&project.ID, &project.OwnerUserID, &project.GitHubInstallationID, &project.RepoFullName, &project.Status, &project.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil, ErrBountyNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	bounty.NetPayoutSats = bounty.RewardSats - bounty.FeeSats
+	return &bounty, &project, nil
+}
+
+type Project struct {
+	ID                   int64     `json:"id"`
+	OwnerUserID          int64     `json:"owner_user_id"`
+	GitHubInstallationID int64     `json:"github_installation_id"`
+	RepoFullName         string    `json:"repo_full_name"`
+	Status               string    `json:"status"`
+	CreatedAt            time.Time `json:"created_at"`
+}
+
+func (s *Service) GetProjectByID(ctx context.Context, projectID int64) (*Project, error) {
+	var project Project
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, owner_user_id, github_installation_id, repo_full_name, status, created_at
+		FROM projects WHERE id = $1
+	`, projectID).Scan(&project.ID, &project.OwnerUserID, &project.GitHubInstallationID, &project.RepoFullName, &project.Status, &project.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, errors.New("project not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &project, nil
+}
+
+func (s *Service) GetWallet(ctx context.Context, projectID int64) (*Wallet, error) {
+	var wallet Wallet
+	err := s.pool.QueryRow(ctx, `
+		SELECT available_sats, reserved_sats FROM wallets WHERE project_id = $1
+	`, projectID).Scan(&wallet.AvailableSats, &wallet.ReservedSats)
+	if err == sql.ErrNoRows {
+		return &Wallet{AvailableSats: 0, ReservedSats: 0}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &wallet, nil
+}
+
+type Wallet struct {
+	AvailableSats int64 `json:"available_sats"`
+	ReservedSats  int64 `json:"reserved_sats"`
+}
+
+func (s *Service) CreateDeposit(ctx context.Context, projectID int64, amountSats int64, idempotencyKey string) (*Deposit, error) {
+	var deposit Deposit
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO deposits (project_id, bolt11, payment_hash, amount_sats, status, expires_at)
+		VALUES ($1, $2, $3, $4, 'pending', now() + interval '1 hour')
+		RETURNING id, project_id, bolt11, payment_hash, amount_sats, status, expires_at, created_at
+	`, projectID, "placeholder", "placeholder", amountSats).Scan(
+		&deposit.ID, &deposit.ProjectID, &deposit.Bolt11, &deposit.PaymentHash, &deposit.AmountSats, &deposit.Status, &deposit.ExpiresAt, &deposit.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &deposit, nil
+}
+
+type Deposit struct {
+	ID           int64     `json:"id"`
+	ProjectID    int64     `json:"project_id"`
+	Bolt11       string    `json:"bolt11"`
+	PaymentHash  []byte    `json:"payment_hash"`
+	AmountSats   int64     `json:"amount_sats"`
+	Status       string    `json:"status"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	SettledAt    *time.Time `json:"settled_at,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
