@@ -20,12 +20,13 @@ import (
 var (
 	ErrUnauthorized = errors.New("unauthorized")
 	ErrInvalidToken = errors.New("invalid token")
+	ErrUserNotFound = errors.New("user not found")
 )
 
 type Service struct {
 	cfg  *config.Config
 	pool *pgxpool.Pool
-	log  *zerolog.Logger
+	log  zerolog.Logger
 }
 
 type Claims struct {
@@ -34,10 +35,11 @@ type Claims struct {
 }
 
 func NewService(cfg *config.Config, pool *pgxpool.Pool) *Service {
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}).With().Timestamp().Logger()
 	return &Service{
 		cfg:  cfg,
 		pool: pool,
-		log:  zerolog.New(zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}}}).With().Timestamp().Logger(),
+		log:  logger,
 	}
 }
 
@@ -122,6 +124,37 @@ func GetUserID(c *gin.Context) (int64, bool) {
 	}
 	id, ok := userID.(int64)
 	return id, ok
+}
+
+func (s *Service) GetUserByGitHubID(ctx context.Context, githubID int64) (int64, string, string, error) {
+	var userID int64
+	var login, email string
+	err := s.pool.QueryRow(ctx, `SELECT id, github_login, email FROM users WHERE github_id = $1`, githubID).Scan(&userID, &login, &email)
+	if err != nil {
+		return 0, "", "", err
+	}
+	return userID, login, email, nil
+}
+
+func (s *Service) GetUserByID(ctx context.Context, userID int64) (int64, string, string, string, error) {
+	var githubID int64
+	var login, email, lightningAddress string
+	err := s.pool.QueryRow(ctx, `SELECT github_id, github_login, email, lightning_address FROM users WHERE id = $1`, userID).Scan(&githubID, &login, &email, &lightningAddress)
+	if err != nil {
+		return 0, "", "", "", err
+	}
+	return githubID, login, email, lightningAddress, nil
+}
+
+func (s *Service) UpsertUser(ctx context.Context, githubID int64, login, email string) (int64, error) {
+	var userID int64
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO users (github_id, github_login, email)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (github_id) DO UPDATE SET github_login = EXCLUDED.github_login, email = EXCLUDED.email
+		RETURNING id
+	`, githubID, login, email).Scan(&userID)
+	return userID, err
 }
 
 func ContextWithUserID(ctx context.Context, userID int64) context.Context {
