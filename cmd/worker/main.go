@@ -37,19 +37,29 @@ func main() {
 	}
 	defer pool.Close()
 
-	workers := riverpgxv5.NewWorker(pool, &river.Config{
+	workers := river.NewWorkers()
+	river.AddWorker(workers, &queue.ProcessPayoutJob{})
+	river.AddWorker(workers, &queue.ProcessWebhookJob{})
+	river.AddWorker(workers, &queue.ReconciliationJob{})
+	river.AddWorker(workers, &queue.ClaimExpiryJob{})
+
+	driver := riverpgxv5.New(pool)
+	client, err := river.NewClient(driver, &river.Config{
 		Queues: map[string]river.QueueConfig{
 			river.QueueDefault: {MaxWorkers: 10},
 			"payouts":          {MaxWorkers: 5},
 			"webhooks":         {MaxWorkers: 10},
 			"reconciliation":   {MaxWorkers: 1},
 		},
-		Jobs: queue.JobRegistry(),
+		Workers: workers,
 	})
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to create river client")
+	}
 
 	go func() {
 		log.Info().Msg("starting worker")
-		if err := workers.Start(context.Background()); err != nil {
+		if err := client.Start(context.Background()); err != nil {
 			log.Fatal().Err(err).Msg("worker error")
 		}
 	}()
@@ -63,8 +73,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	workers.Stop()
-	<-workers.Done()
+	client.Stop(ctx)
 
 	log.Info().Msg("worker exited")
 }
