@@ -1,0 +1,209 @@
+openapi: 3.0.3
+info:
+  title: Satlight API
+  version: 0.1.0
+  description: Bitcoin-native bounty marketplace. All amounts are integer sats.
+servers:
+  - url: http://localhost:8080/api/v1
+security:
+  - session: []
+paths:
+  /waitlist:
+    post:
+      summary: Join waitlist
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WaitlistRequest' }
+      responses:
+        '204': { description: Added }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /bounties:
+    get:
+      summary: List open bounties
+      security: []
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: language, in: query, schema: { type: string } }
+        - { name: difficulty, in: query, schema: { $ref: '#/components/schemas/Difficulty' } }
+        - { name: min_reward, in: query, schema: { type: integer } }
+        - { name: max_reward, in: query, schema: { type: integer } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: Page of bounties
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Bounty' } }
+                  next_cursor: { type: string, nullable: true }
+  /bounties/{id}:
+    get:
+      summary: Bounty detail
+      security: []
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Bounty, content: { application/json: { schema: { $ref: '#/components/schemas/Bounty' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /bounties/{id}/claim:
+    post:
+      summary: Claim a bounty
+      parameters: [ { $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses:
+        '201': { description: Claim created, content: { application/json: { schema: { $ref: '#/components/schemas/Claim' } } } }
+        '409': { description: Already claimed or not open, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: Missing payout destination or ineligible }
+    delete:
+      summary: Release claim
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '204': { description: Released }
+  /bounties/{id}/cancel:
+    post:
+      summary: Cancel bounty and refund reserved funds (maintainer)
+      parameters: [ { $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses:
+        '200': { description: Cancelled, content: { application/json: { schema: { $ref: '#/components/schemas/Bounty' } } } }
+        '409': { description: Not cancellable in current state }
+  /bounties/{id}/dispute:
+    post:
+      summary: Open a dispute
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/DisputeRequest' } } }
+      responses:
+        '201': { description: Dispute opened }
+  /projects:
+    post:
+      summary: Register a project (maintainer with GitHub App installed)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProjectCreate' } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Project' } } } }
+        '403': { description: Not an admin of the repository }
+  /projects/{id}/wallet:
+    get:
+      summary: Wallet balances
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200': { description: Wallet, content: { application/json: { schema: { $ref: '#/components/schemas/Wallet' } } } }
+  /projects/{id}/deposits:
+    post:
+      summary: Create funding invoice
+      parameters: [ { $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [amount_sats], properties: { amount_sats: { type: integer, minimum: 1000 } } } } }
+      responses:
+        '201': { description: Invoice, content: { application/json: { schema: { $ref: '#/components/schemas/Deposit' } } } }
+  /projects/{id}/withdrawals:
+    post:
+      summary: Withdraw unreserved funds
+      parameters: [ { $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [amount_sats, destination], properties: { amount_sats: { type: integer }, destination: { type: string } } } } }
+      responses:
+        '202': { description: Withdrawal queued }
+  /projects/{id}/bounties:
+    post:
+      summary: Create and fund a bounty
+      parameters: [ { $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/BountyCreate' } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Bounty' } } } }
+        '402': { description: Insufficient wallet balance }
+  /me:
+    get:
+      summary: Current user
+      responses:
+        '200': { description: User, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+  /me/payout-destination:
+    put:
+      summary: Set Lightning address
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [lightning_address], properties: { lightning_address: { type: string, example: you@wallet.example } } } } }
+      responses:
+        '200': { description: Updated (may require email confirmation and cooldown) }
+  /me/payouts:
+    get:
+      summary: Payout history
+      responses:
+        '200': { description: Payouts, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Payout' } } } } }
+  /payouts/claim/{token}:
+    get:
+      summary: Redeem a payout claim link (LNURL-withdraw)
+      security: []
+      parameters: [ { name: token, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { description: LNURL-withdraw response }
+  /webhooks/github:
+    post:
+      summary: GitHub webhook receiver
+      security: [ { githubSignature: [] } ]
+      responses:
+        '200': { description: Accepted (idempotent) }
+        '401': { description: Invalid signature }
+components:
+  securitySchemes:
+    session: { type: apiKey, in: cookie, name: satlight_session }
+    githubSignature: { type: apiKey, in: header, name: X-Hub-Signature-256 }
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: integer } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 128 } }
+  responses:
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    RateLimited: { description: Too many requests, headers: { Retry-After: { schema: { type: integer } } } }
+  schemas:
+    Difficulty: { type: string, enum: [trivial, easy, medium, hard] }
+    BountyState: { type: string, enum: [draft, open, claimed, in_review, merged, paid, payout_failed, expired, cancelled, disputed] }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties: { code: { type: string }, message: { type: string } }
+    WaitlistRequest: { type: object, required: [email], properties: { email: { type: string, format: email }, role: { type: string, enum: [maintainer, contributor] } } }
+    User: { type: object, properties: { id: { type: integer }, github_login: { type: string }, lightning_address: { type: string, nullable: true } } }
+    Project: { type: object, properties: { id: { type: integer }, repo_full_name: { type: string }, status: { type: string } } }
+    ProjectCreate: { type: object, required: [repo_full_name, installation_id], properties: { repo_full_name: { type: string }, installation_id: { type: integer } } }
+    Wallet: { type: object, properties: { available_sats: { type: integer }, reserved_sats: { type: integer } } }
+    Deposit: { type: object, properties: { id: { type: integer }, bolt11: { type: string }, amount_sats: { type: integer }, status: { type: string }, expires_at: { type: string, format: date-time } } }
+    BountyCreate:
+      type: object
+      required: [github_issue_number, title, description, difficulty, reward_sats]
+      properties:
+        github_issue_number: { type: integer }
+        title: { type: string, maxLength: 140 }
+        description: { type: string }
+        difficulty: { $ref: '#/components/schemas/Difficulty' }
+        reward_sats: { type: integer, minimum: 500 }
+        expires_at: { type: string, format: date-time }
+    Bounty:
+      type: object
+      properties:
+        id: { type: integer }
+        repo_full_name: { type: string }
+        github_issue_number: { type: integer }
+        title: { type: string }
+        description: { type: string }
+        difficulty: { $ref: '#/components/schemas/Difficulty' }
+        reward_sats: { type: integer }
+        fee_sats: { type: integer }
+        net_payout_sats: { type: integer }
+        state: { $ref: '#/components/schemas/BountyState' }
+        expires_at: { type: string, format: date-time }
+    Claim: { type: object, properties: { id: { type: integer }, bounty_id: { type: integer }, status: { type: string }, expires_at: { type: string, format: date-time } } }
+    Payout: { type: object, properties: { id: { type: integer }, bounty_id: { type: integer }, amount_sats: { type: integer }, fee_sats: { type: integer }, status: { type: string }, settled_at: { type: string, format: date-time, nullable: true } } }
+    DisputeRequest: { type: object, required: [reason], properties: { reason: { type: string }, evidence: { type: string } } }

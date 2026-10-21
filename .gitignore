@@ -1,0 +1,67 @@
+# Environment files - NEVER commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Local development configs - contains macaroons, certs, private keys
+dev/
+!dev/.gitkeep
+
+# Go build outputs
+bin/
+*.exe
+*.test
+*.prof
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+coverage.out
+coverage.html
+
+# Web frontend
+web/node_modules/
+web/dist/
+web/.vite/
+web/.eslintcache
+
+# Docker
+docker-compose.override.yml
+
+# Generated files
+*.pb.go
+mock_*.go
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Certificates and keys (if accidentally placed outside dev/)
+*.pem
+*.key
+*.crt
+*.cert
+*.macaroon
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup files
+*.bak
+*.backup

@@ -1,0 +1,194 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: satlight-postgres
+    environment:
+      POSTGRES_USER: satlight
+      POSTGRES_PASSWORD: satlight
+      POSTGRES_DB: satlight
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U satlight -d satlight"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  bitcoind:
+    image: lncm/bitcoind:v26.0
+    container_name: satlight-bitcoind
+    command: [
+      "-regtest=1",
+      "-fallbackfee=0.0001",
+      "-txindex=1",
+      "-rpcuser=satlight",
+      "-rpcpassword=satlight",
+      "-zmqpubrawblock=tcp://0.0.0.0:28332",
+      "-zmqpubrawtx=tcp://0.0.0.0:28333"
+    ]
+    ports:
+      - "18443:18443"
+      - "18444:18444"
+    volumes:
+      - bitcoind_data:/data
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=satlight", "-rpcpassword=satlight", "getblockchaininfo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  lnd:
+    image: lightninglabs/lnd:v0.18.0-beta
+    container_name: satlight-lnd
+    command: [
+      "--bitcoin.regtest=1",
+      "--bitcoin.active=1",
+      "--bitcoin.node=bitcoind",
+      "--bitcoind.rpcuser=satlight",
+      "--bitcoind.rpcpass=satlight",
+      "--bitcoind.zmqpubrawblock=tcp://bitcoind:28332",
+      "--bitcoind.zmqpubrawtx=tcp://bitcoind:28333",
+      "--lnd.externalip=localhost",
+      "--lnd.listen=0.0.0.0:9735",
+      "--lnd.rpclisten=0.0.0.0:10009",
+      "--lnd.restlisten=0.0.0.0:8080",
+      "--lnd.tlsextradomain=localhost",
+      "--lnd.no-macaroons=false",
+      "--lnd.macaroonpath=/data/chain/bitcoin/regtest/admin.macaroon",
+      "--lnd.invoicemacaroonpath=/data/chain/bitcoin/regtest/invoice.macaroon",
+      "--lnd.paymentmacaroonpath=/data/chain/bitcoin/regtest/payment.macaroon"
+    ]
+    ports:
+      - "9735:9735"
+      - "10009:10009"
+      - "8081:8080"
+    volumes:
+      - lnd_data:/data
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      - LND_BITCOIND_RPCUSER=satlight
+      - LND_BITCOIND_RPCPASS=satlight
+    healthcheck:
+      test: ["CMD", "lncli", "--network=regtest", "--rpcserver=localhost:10009", "--macaroonpath=/data/chain/bitcoin/regtest/admin.macaroon", "getinfo"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  lnd-contributor:
+    image: lightninglabs/lnd:v0.18.0-beta
+    container_name: satlight-lnd-contributor
+    command: [
+      "--bitcoin.regtest=1",
+      "--bitcoin.active=1",
+      "--bitcoin.node=bitcoind",
+      "--bitcoind.rpcuser=satlight",
+      "--bitcoind.rpcpass=satlight",
+      "--bitcoind.zmqpubrawblock=tcp://bitcoind:28332",
+      "--bitcoind.zmqpubrawtx=tcp://bitcoind:28333",
+      "--lnd.externalip=localhost",
+      "--lnd.listen=0.0.0.0:9736",
+      "--lnd.rpclisten=0.0.0.0:10010",
+      "--lnd.restlisten=0.0.0.0:8082",
+      "--lnd.tlsextradomain=localhost",
+      "--lnd.no-macaroons=false"
+    ]
+    ports:
+      - "9736:9736"
+      - "10010:10010"
+      - "8083:8080"
+    volumes:
+      - lnd_contributor_data:/data
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      - LND_BITCOIND_RPCUSER=satlight
+      - LND_BITCOIND_RPCPASS=satlight
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: satlight-api
+    command: ["/app/satlight-api"]
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_ENV=development
+      - NETWORK=regtest
+      - HTTP_ADDR=:8080
+      - BASE_URL=http://localhost:8080
+      - DATABASE_URL=postgres://satlight:satlight@postgres:5432/satlight?sslmode=disable
+      - LND_HOST=lnd:10009
+      - LND_TLS_CERT=/data/tls.cert
+      - LND_INVOICE_MACAROON=/data/chain/bitcoin/regtest/invoice.macaroon
+      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/payment.macaroon
+      - PLATFORM_FEE_BPS=200
+      - BOUNTY_DEFAULT_EXPIRY_DAYS=90
+      - CLAIM_EXPIRY_DAYS=7
+      - PAYOUTS_PAUSED=false
+      - MIN_REWARD_SATS=500
+      - SESSION_SECRET=dev-session-secret-change-in-production
+      - ENCRYPTION_KEY=dev-encryption-key-change-in-production
+      - LOG_LEVEL=debug
+    volumes:
+      - lnd_data:/data:ro
+      - ./dev/lnd:/dev/lnd:ro
+      - ./dev/github:/dev/github:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      lnd:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: satlight-worker
+    command: ["/app/satlight-worker"]
+    environment:
+      - APP_ENV=development
+      - NETWORK=regtest
+      - DATABASE_URL=postgres://satlight:satlight@postgres:5432/satlight?sslmode=disable
+      - LND_HOST=lnd:10009
+      - LND_TLS_CERT=/data/tls.cert
+      - LND_INVOICE_MACAROON=/data/chain/bitcoin/regtest/invoice.macaroon
+      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/payment.macaroon
+      - PLATFORM_FEE_BPS=200
+      - PAYOUTS_PAUSED=false
+      - LOG_LEVEL=debug
+    volumes:
+      - lnd_data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      lnd:
+        condition: service_healthy
+
+  web:
+    image: node:20-alpine
+    container_name: satlight-web
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 3000"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./web:/app
+    environment:
+      - VITE_API_URL=http://localhost:8080/api/v1
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  bitcoind_data:
+  lnd_data:
+  lnd_contributor_data:

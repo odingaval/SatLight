@@ -1,0 +1,40 @@
+{
+  "action": "closed",
+  "number": 42,
+  "pull_request": {
+    "number": 42,
+    "title": "Fix typo in README",
+    "body": "Closes #1\n\nFixed the typo in the installation section.",
+    "state": "closed",
+    "merged": true,
+    "merged_at": "2026-10-21T10:30:00Z",
+    "merge_commit_sha": "abc123def456",
+    "head": {
+      "sha": "def456abc123"
+    },
+    "user": {
+      "id": 67890,
+      "login": "demo-contributor"
+    },
+    "base": {
+      "repo": {
+        "full_name": "demo/repo",
+        "owner": {
+          "id": 12345,
+          "login": "demo-maintainer"
+        }
+      }
+    }
+  },
+  "repository": {
+    "full_name": "demo/repo",
+    "owner": {
+      "id": 12345,
+      "login": "demo-maintainer"
+    }
+  },
+  "sender": {
+    "id": 67890,
+    "login": "demo-contributor"
+  }
+}
