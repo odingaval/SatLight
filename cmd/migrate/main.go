@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -41,8 +40,6 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to create migrate instance")
 	}
 	defer m.Close()
-
-	ctx := context.Background()
 
 	switch *direction {
 	case "up":
