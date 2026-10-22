@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -94,23 +95,23 @@ func validateEntries(entries []Entry) error {
 
 func (s *Service) ReserveBountyFunds(ctx context.Context, tx pgx.Tx, projectID, bountyID int64, rewardSats, feeSats int64) error {
 	return s.RecordTransaction(ctx, tx, []Entry{
-		{Account: "project:" + string(rune(projectID)) + ":available", Direction: "debit", AmountSats: rewardSats, RefType: "bounty_reserve", RefID: bountyID},
-		{Account: "project:" + string(rune(projectID)) + ":reserved", Direction: "credit", AmountSats: rewardSats, RefType: "bounty_reserve", RefID: bountyID},
+		{Account: projectAccount(projectID, "available"), Direction: "debit", AmountSats: rewardSats, RefType: "bounty_reserve", RefID: bountyID},
+		{Account: projectAccount(projectID, "reserved"), Direction: "credit", AmountSats: rewardSats, RefType: "bounty_reserve", RefID: bountyID},
 	})
 }
 
 func (s *Service) RefundBountyFunds(ctx context.Context, tx pgx.Tx, projectID, bountyID int64, rewardSats int64) error {
 	return s.RecordTransaction(ctx, tx, []Entry{
-		{Account: "project:" + string(rune(projectID)) + ":reserved", Direction: "debit", AmountSats: rewardSats, RefType: "bounty_refund", RefID: bountyID},
-		{Account: "project:" + string(rune(projectID)) + ":available", Direction: "credit", AmountSats: rewardSats, RefType: "bounty_refund", RefID: bountyID},
+		{Account: projectAccount(projectID, "reserved"), Direction: "debit", AmountSats: rewardSats, RefType: "bounty_refund", RefID: bountyID},
+		{Account: projectAccount(projectID, "available"), Direction: "credit", AmountSats: rewardSats, RefType: "bounty_refund", RefID: bountyID},
 	})
 }
 
 func (s *Service) ProcessPayout(ctx context.Context, tx pgx.Tx, projectID, bountyID, userID int64, rewardSats, feeSats, routingFeeSats int64) error {
 	netPayout := rewardSats - feeSats
 	return s.RecordTransaction(ctx, tx, []Entry{
-		{Account: "project:" + string(rune(projectID)) + ":reserved", Direction: "debit", AmountSats: rewardSats, RefType: "payout", RefID: bountyID},
-		{Account: "user:" + string(rune(userID)) + ":external", Direction: "credit", AmountSats: netPayout, RefType: "payout", RefID: bountyID},
+		{Account: projectAccount(projectID, "reserved"), Direction: "debit", AmountSats: rewardSats, RefType: "payout", RefID: bountyID},
+		{Account: "user:" + strconv.FormatInt(userID, 10) + ":external", Direction: "credit", AmountSats: netPayout, RefType: "payout", RefID: bountyID},
 		{Account: "platform:fees", Direction: "credit", AmountSats: feeSats, RefType: "payout", RefID: bountyID},
 		{Account: "platform:routing_costs", Direction: "credit", AmountSats: routingFeeSats, RefType: "payout", RefID: bountyID},
 	})
@@ -119,8 +120,12 @@ func (s *Service) ProcessPayout(ctx context.Context, tx pgx.Tx, projectID, bount
 func (s *Service) CreditDeposit(ctx context.Context, tx pgx.Tx, projectID, depositID int64, amountSats int64) error {
 	return s.RecordTransaction(ctx, tx, []Entry{
 		{Account: "node:liquidity", Direction: "debit", AmountSats: amountSats, RefType: "deposit", RefID: depositID},
-		{Account: "project:" + string(rune(projectID)) + ":available", Direction: "credit", AmountSats: amountSats, RefType: "deposit", RefID: depositID},
+		{Account: projectAccount(projectID, "available"), Direction: "credit", AmountSats: amountSats, RefType: "deposit", RefID: depositID},
 	})
+}
+
+func projectAccount(projectID int64, bucket string) string {
+	return "project:" + strconv.FormatInt(projectID, 10) + ":" + bucket
 }
 
 func (s *Service) GetAccountBalance(ctx context.Context, account string) (int64, error) {

@@ -41,10 +41,12 @@ CREATE TABLE deposits (
   payment_hash BYTEA NOT NULL UNIQUE,
   amount_sats  BIGINT NOT NULL CHECK (amount_sats > 0),
   status       deposit_status NOT NULL DEFAULT 'pending',
+  idempotency_key TEXT,
   expires_at   TIMESTAMPTZ NOT NULL,
   settled_at   TIMESTAMPTZ,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX deposits_project_idempotency_idx ON deposits(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 CREATE TABLE bounties (
   id                  BIGSERIAL PRIMARY KEY,

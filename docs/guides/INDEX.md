@@ -14,7 +14,7 @@
 - `specs/state-machine.md`, `specs/ledger-and-accounting.md`
 - `specs/lightning-integration.md`, `specs/github-integration.md`
 - `specs/notifications.md`, `specs/reputation-system.md`, `specs/analytics-plan.md`
-- `../openapi.yaml` and `../migrations/0001_init.sql`
+- `../openapi.yaml` and `../migrations/000001_init.up.sql`
 - `specs/testing-strategy.md`, `specs/monitoring.md`
 
 ## Security and trust

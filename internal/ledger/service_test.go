@@ -16,6 +16,12 @@ func TestValidateEntriesAcceptsBalancedTransaction(t *testing.T) {
 	}
 }
 
+func TestProjectAccountUsesDecimalIDs(t *testing.T) {
+	if got, want := projectAccount(1024, "available"), "project:1024:available"; got != want {
+		t.Fatalf("projectAccount() = %q, want %q", got, want)
+	}
+}
+
 func TestValidateEntriesRejectsInvalidTransactions(t *testing.T) {
 	for _, test := range []struct {
 		name    string
