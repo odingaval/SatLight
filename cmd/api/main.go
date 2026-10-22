@@ -39,6 +39,12 @@ func main() {
 	defer pool.Close()
 
 	server := api.NewServer(cfg, pool)
+	if cfg.LNDHost != "" {
+		invoiceCtx, stopInvoiceWatcher := context.WithCancel(context.Background())
+		defer server.CloseLightning()
+		defer stopInvoiceWatcher()
+		go server.WatchLightningInvoices(invoiceCtx)
+	}
 
 	httpServer := &http.Server{
 		Addr:    cfg.HTTPAddr,

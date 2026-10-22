@@ -99,6 +99,50 @@ func (s *Server) Router() *gin.Engine {
 	return s.router
 }
 
+func (s *Server) ConnectLightning(ctx context.Context) error {
+	return s.services.Lightning.Connect(ctx)
+}
+
+func (s *Server) CloseLightning() error {
+	return s.services.Lightning.Close()
+}
+
+// WatchLightningInvoices reconnects the invoice stream after transient LND or
+// network failures and settles matching project deposits.
+func (s *Server) WatchLightningInvoices(ctx context.Context) {
+	for ctx.Err() == nil {
+		if !s.services.Lightning.Connected() {
+			if err := s.ConnectLightning(ctx); err != nil {
+				s.logger.Warn().Err(err).Msg("could not connect to Lightning node; retrying")
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+				}
+				continue
+			}
+		}
+		err := s.services.Lightning.SubscribeInvoices(ctx, func(paymentHash []byte, amountPaidSats int64) error {
+			err := s.services.Bounty.SettleDeposit(ctx, paymentHash, amountPaidSats)
+			if errors.Is(err, bounty.ErrDepositNotFound) {
+				return nil
+			}
+			return err
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			s.logger.Warn().Err(err).Msg("Lightning invoice stream interrupted; reconnecting")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 func (s *Server) setupRoutes() {
 	s.router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -545,11 +589,32 @@ func (s *Server) handleCreateDeposit(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": err.Error()}})
 		return
 	}
+	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if len(idempotencyKey) < 8 || len(idempotencyKey) > 128 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_IDEMPOTENCY_KEY", "message": "Idempotency-Key must contain 8 to 128 characters"}})
+		return
+	}
+	if existing, err := s.services.Bounty.GetDepositByIdempotencyKey(c.Request.Context(), project.ID, idempotencyKey); err != nil {
+		s.logger.Error().Err(err).Msg("failed to look up idempotent deposit")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not check existing invoice"}})
+		return
+	} else if existing != nil {
+		c.JSON(http.StatusOK, existing)
+		return
+	}
 
-	bolt11 := "lnbc" + strconv.FormatInt(req.AmountSats, 10) + "u1pplaceholder"
-	paymentHash := []byte("placeholder_hash")
-
-	deposit, err := s.services.Bounty.CreateDeposit(c.Request.Context(), project.ID, req.AmountSats, "")
+	if !s.services.Lightning.Connected() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "LIGHTNING_UNAVAILABLE", "message": "Lightning invoice service is unavailable"}})
+		return
+	}
+	expiresAt := time.Now().Add(time.Hour)
+	bolt11, paymentHash, err := s.services.Lightning.CreateInvoice(c.Request.Context(), req.AmountSats, "Satlight project wallet funding", time.Hour)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to create Lightning invoice")
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "INVOICE_CREATION_FAILED", "message": "could not create Lightning invoice"}})
+		return
+	}
+	deposit, err := s.services.Bounty.CreateDeposit(c.Request.Context(), project.ID, idempotencyKey, bolt11, paymentHash, req.AmountSats, expiresAt)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to create deposit")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to create deposit"}})

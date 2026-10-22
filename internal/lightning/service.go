@@ -26,21 +26,21 @@ var (
 )
 
 type Service struct {
-	cfg           *Config
-	pool          *pgxpool.Pool
+	cfg             *Config
+	pool            *pgxpool.Pool
 	lightningClient lnrpc.LightningClient
 	routerClient    routerrpc.RouterClient
-	conn          *grpc.ClientConn
-	log           zerolog.Logger
+	conn            *grpc.ClientConn
+	log             zerolog.Logger
 }
 
 type Config struct {
-	Host             string
-	TLSCertPath      string
-	InvoiceMacaroon  string
-	PaymentMacaroon  string
-	MaxFeePPM        int64
-	MaxFeeFloorSats  int64
+	Host            string
+	TLSCertPath     string
+	InvoiceMacaroon string
+	PaymentMacaroon string
+	MaxFeePPM       int64
+	MaxFeeFloorSats int64
 }
 
 func NewService(cfg interface{}, pool *pgxpool.Pool) *Service {
@@ -111,16 +111,47 @@ func (s *Service) Close() error {
 	return nil
 }
 
+func (s *Service) Connected() bool {
+	return s.lightningClient != nil
+}
+
 func (s *Service) CreateInvoice(ctx context.Context, amountSats int64, memo string, expiry time.Duration) (string, []byte, error) {
+	if s.lightningClient == nil {
+		return "", nil, ErrNodeUnhealthy
+	}
 	resp, err := s.lightningClient.AddInvoice(ctx, &lnrpc.Invoice{
-		Value:    amountSats,
-		Memo:     memo,
-		Expiry:   int64(expiry.Seconds()),
+		Value:  amountSats,
+		Memo:   memo,
+		Expiry: int64(expiry.Seconds()),
 	})
 	if err != nil {
 		return "", nil, err
 	}
 	return resp.PaymentRequest, resp.RHash, nil
+}
+
+// SubscribeInvoices streams settled invoice updates to handler. Callers should
+// reconnect this stream when it returns an error.
+func (s *Service) SubscribeInvoices(ctx context.Context, handler func(paymentHash []byte, amountPaidSats int64) error) error {
+	if s.lightningClient == nil {
+		return ErrNodeUnhealthy
+	}
+	stream, err := s.lightningClient.SubscribeInvoices(ctx, &lnrpc.InvoiceSubscription{})
+	if err != nil {
+		return err
+	}
+	for {
+		invoice, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		if invoice.State != lnrpc.Invoice_SETTLED {
+			continue
+		}
+		if err := handler(invoice.RHash, invoice.AmtPaidSat); err != nil {
+			return err
+		}
+	}
 }
 
 func (s *Service) PayInvoice(ctx context.Context, invoice string, maxFeeSats int64) ([]byte, error) {

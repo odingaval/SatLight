@@ -119,6 +119,9 @@ paths:
         content: { application/json: { schema: { type: object, required: [amount_sats], properties: { amount_sats: { type: integer, minimum: 1000 } } } } }
       responses:
         '201': { description: Invoice, content: { application/json: { schema: { $ref: '#/components/schemas/Deposit' } } } }
+        '200': { description: Existing invoice returned for an idempotent retry, content: { application/json: { schema: { $ref: '#/components/schemas/Deposit' } } } }
+        '502': { description: Lightning node failed to create an invoice }
+        '503': { description: Lightning invoice service is unavailable }
   /projects/{id}/withdrawals:
     post:
       summary: Withdraw unreserved funds

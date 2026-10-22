@@ -108,7 +108,17 @@ async function renderDashboard(app: HTMLDivElement, projectId: string, preview =
       if (response.status === 401) { signIn(); return }
       if (!response.ok) throw new Error(data.error?.message ?? 'Could not create an invoice.')
       if (data.bolt11?.includes('placeholder')) throw new Error('Invoice generation is not connected yet. Wallet funding will be available when the Lightning backend is enabled.')
-      message.textContent = data.bolt11 ? `Invoice: ${data.bolt11}` : 'Invoice created. Check your Lightning wallet.'; message.className = 'dashboard-message is-success'
+      if (data.bolt11) {
+        const invoicePanel = document.querySelector<HTMLDivElement>('#qr-invoice')!
+        invoicePanel.classList.add('has-invoice')
+        invoicePanel.innerHTML = `<strong>Lightning invoice ready</strong><code>${escapeHtml(data.bolt11)}</code><button type="button" class="copy-invoice">Copy invoice</button>`
+        invoicePanel.querySelector<HTMLButtonElement>('.copy-invoice')!.addEventListener('click', async () => {
+          try { await navigator.clipboard.writeText(data.bolt11!); message.textContent = 'Invoice copied to clipboard.'; message.className = 'dashboard-message is-success' }
+          catch { message.textContent = 'Copy unavailable. Select the invoice text to copy it.'; message.className = 'dashboard-message' }
+        })
+        message.textContent = 'Pay this invoice with a Lightning wallet. The balance updates after settlement.'
+      } else message.textContent = 'Invoice created. Check your Lightning wallet.'
+      message.className = 'dashboard-message is-success'
     } catch (error) { message.textContent = error instanceof Error ? error.message : 'Could not create an invoice.'; message.className = 'dashboard-message is-error' }
   })
   document.querySelector<HTMLFormElement>('#create-bounty-form')?.addEventListener('submit', async (event) => {

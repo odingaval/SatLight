@@ -22,6 +22,8 @@ var (
 	ErrInsufficientFunds    = errors.New("insufficient wallet balance")
 	ErrInvalidState         = errors.New("invalid bounty state for this operation")
 	ErrNotAuthorized        = errors.New("not authorized")
+	ErrDepositNotFound      = errors.New("deposit not found")
+	ErrDepositUnderpaid     = errors.New("settled amount is below the invoice amount")
 )
 
 type Service struct {
@@ -496,13 +498,27 @@ type Wallet struct {
 	ReservedSats  int64 `json:"reserved_sats"`
 }
 
-func (s *Service) CreateDeposit(ctx context.Context, projectID int64, amountSats int64, idempotencyKey string) (*Deposit, error) {
+func (s *Service) GetDepositByIdempotencyKey(ctx context.Context, projectID int64, idempotencyKey string) (*Deposit, error) {
+	deposit, err := scanDeposit(s.pool.QueryRow(ctx, `
+		SELECT id, project_id, bolt11, payment_hash, amount_sats, status, expires_at, settled_at, created_at
+		FROM deposits WHERE project_id = $1 AND idempotency_key = $2
+	`, projectID, idempotencyKey))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &deposit, nil
+}
+
+func (s *Service) CreateDeposit(ctx context.Context, projectID int64, idempotencyKey, bolt11 string, paymentHash []byte, amountSats int64, expiresAt time.Time) (*Deposit, error) {
 	var deposit Deposit
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO deposits (project_id, bolt11, payment_hash, amount_sats, status, expires_at)
-		VALUES ($1, $2, $3, $4, 'pending', now() + interval '1 hour')
+		INSERT INTO deposits (project_id, bolt11, payment_hash, amount_sats, status, idempotency_key, expires_at)
+		VALUES ($1, $2, $3, $4, 'pending', $5, $6)
 		RETURNING id, project_id, bolt11, payment_hash, amount_sats, status, expires_at, created_at
-	`, projectID, "placeholder", "placeholder", amountSats).Scan(
+	`, projectID, bolt11, paymentHash, amountSats, idempotencyKey, expiresAt).Scan(
 		&deposit.ID, &deposit.ProjectID, &deposit.Bolt11, &deposit.PaymentHash, &deposit.AmountSats, &deposit.Status, &deposit.ExpiresAt, &deposit.CreatedAt,
 	)
 	if err != nil {
@@ -511,14 +527,68 @@ func (s *Service) CreateDeposit(ctx context.Context, projectID int64, amountSats
 	return &deposit, nil
 }
 
+func scanDeposit(row interface{ Scan(...any) error }) (Deposit, error) {
+	var deposit Deposit
+	err := row.Scan(&deposit.ID, &deposit.ProjectID, &deposit.Bolt11, &deposit.PaymentHash, &deposit.AmountSats, &deposit.Status, &deposit.ExpiresAt, &deposit.SettledAt, &deposit.CreatedAt)
+	return deposit, err
+}
+
+// SettleDeposit credits a wallet and its ledger atomically. It is safe to call
+// repeatedly when LND replays an already processed invoice update.
+func (s *Service) SettleDeposit(ctx context.Context, paymentHash []byte, amountPaidSats int64) error {
+	if amountPaidSats <= 0 {
+		return errors.New("settled invoice amount must be positive")
+	}
+	if s.ledger == nil {
+		return errors.New("ledger service is not configured")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var deposit Deposit
+	err = tx.QueryRow(ctx, `SELECT id, project_id, amount_sats, status FROM deposits WHERE payment_hash = $1 FOR UPDATE`, paymentHash).Scan(&deposit.ID, &deposit.ProjectID, &deposit.AmountSats, &deposit.Status)
+	if err == sql.ErrNoRows {
+		return ErrDepositNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if deposit.Status == "settled" {
+		return tx.Commit(ctx)
+	}
+	if deposit.Status != "pending" {
+		return errors.New("deposit is not pending")
+	}
+	if amountPaidSats < deposit.AmountSats {
+		return ErrDepositUnderpaid
+	}
+	if _, err := tx.Exec(ctx, `UPDATE deposits SET status = 'settled', amount_sats = $2, settled_at = now() WHERE id = $1`, deposit.ID, amountPaidSats); err != nil {
+		return err
+	}
+	walletUpdate, err := tx.Exec(ctx, `UPDATE wallets SET available_sats = available_sats + $1, updated_at = now() WHERE project_id = $2`, amountPaidSats, deposit.ProjectID)
+	if err != nil {
+		return err
+	}
+	if walletUpdate.RowsAffected() != 1 {
+		return errors.New("project wallet is missing for settled deposit")
+	}
+	if err := s.ledger.CreditDeposit(ctx, tx, deposit.ProjectID, deposit.ID, amountPaidSats); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 type Deposit struct {
-	ID           int64     `json:"id"`
-	ProjectID    int64     `json:"project_id"`
-	Bolt11       string    `json:"bolt11"`
-	PaymentHash  []byte    `json:"payment_hash"`
-	AmountSats   int64     `json:"amount_sats"`
-	Status       string    `json:"status"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	SettledAt    *time.Time `json:"settled_at,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID          int64      `json:"id"`
+	ProjectID   int64      `json:"project_id"`
+	Bolt11      string     `json:"bolt11"`
+	PaymentHash []byte     `json:"payment_hash"`
+	AmountSats  int64      `json:"amount_sats"`
+	Status      string     `json:"status"`
+	ExpiresAt   time.Time  `json:"expires_at"`
+	SettledAt   *time.Time `json:"settled_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
