@@ -2,17 +2,22 @@ package lightning
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"io"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"gopkg.in/macaroon.v2"
 )
-
-// TODO: Re-enable LND gRPC client when compatible version is available
-// Currently blocked by LND v0.21.4-beta protobuf compatibility issue
-// See: https://github.com/lightningnetwork/lnd/issues/XXXX
 
 var (
 	ErrInvoiceExpired = errors.New("invoice expired")
@@ -21,9 +26,12 @@ var (
 )
 
 type Service struct {
-	cfg  *Config
-	pool *pgxpool.Pool
-	log  zerolog.Logger
+	cfg           *Config
+	pool          *pgxpool.Pool
+	lightningClient lnrpc.LightningClient
+	routerClient    routerrpc.RouterClient
+	conn          *grpc.ClientConn
+	log           zerolog.Logger
 }
 
 type Config struct {
@@ -46,42 +54,160 @@ func NewService(cfg interface{}, pool *pgxpool.Pool) *Service {
 }
 
 func (s *Service) Connect(ctx context.Context) error {
-	s.log.Info().Msg("Lightning service connect called (stub)")
+	tlsCreds, err := credentials.NewClientTLSFromFile(s.cfg.TLSCertPath, "")
+	if err != nil {
+		return err
+	}
+
+	// Load invoice macaroon from file
+	invoiceMacBytes, err := os.ReadFile(s.cfg.InvoiceMacaroon)
+	if err != nil {
+		return err
+	}
+	invoiceMac := &macaroon.Macaroon{}
+	if err := invoiceMac.UnmarshalBinary(invoiceMacBytes); err != nil {
+		return err
+	}
+	invoiceCred, err := macaroons.NewMacaroonCredential(invoiceMac)
+	if err != nil {
+		return err
+	}
+
+	// Load payment macaroon from file
+	paymentMacBytes, err := os.ReadFile(s.cfg.PaymentMacaroon)
+	if err != nil {
+		return err
+	}
+	paymentMac := &macaroon.Macaroon{}
+	if err := paymentMac.UnmarshalBinary(paymentMacBytes); err != nil {
+		return err
+	}
+	// paymentCred is created but we use invoiceCred for the connection
+	// Payment macaroon is used via the router client which shares the connection
+	_, _ = macaroons.NewMacaroonCredential(paymentMac)
+
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(tlsCreds),
+		grpc.WithPerRPCCredentials(invoiceCred), // default to invoice cred
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(50 * 1024 * 1024)),
+	}
+
+	conn, err := grpc.DialContext(ctx, s.cfg.Host, opts...)
+	if err != nil {
+		return err
+	}
+
+	s.conn = conn
+	s.lightningClient = lnrpc.NewLightningClient(conn)
+	s.routerClient = routerrpc.NewRouterClient(conn)
+	s.log.Info().Msg("Connected to LND")
 	return nil
 }
 
 func (s *Service) Close() error {
+	if s.conn != nil {
+		return s.conn.Close()
+	}
 	return nil
 }
 
 func (s *Service) CreateInvoice(ctx context.Context, amountSats int64, memo string, expiry time.Duration) (string, []byte, error) {
-	s.log.Info().Int64("amount_sats", amountSats).Msg("CreateInvoice called (stub)")
-	// Return a fake invoice for development
-	return "lnbc" + memo + "placeholder", []byte("placeholder_hash"), nil
+	resp, err := s.lightningClient.AddInvoice(ctx, &lnrpc.Invoice{
+		Value:    amountSats,
+		Memo:     memo,
+		Expiry:   int64(expiry.Seconds()),
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	return resp.PaymentRequest, resp.RHash, nil
 }
 
 func (s *Service) PayInvoice(ctx context.Context, invoice string, maxFeeSats int64) ([]byte, error) {
-	s.log.Info().Str("invoice", invoice).Int64("max_fee", maxFeeSats).Msg("PayInvoice called (stub)")
-	return []byte("placeholder_payment_hash"), nil
+	// Parse the invoice to get the amount and destination
+	payReq, err := s.lightningClient.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: invoice})
+	if err != nil {
+		return nil, err
+	}
+
+	// Use router's SendPaymentV2 for sending payments
+	stream, err := s.routerClient.SendPaymentV2(ctx, &routerrpc.SendPaymentRequest{
+		PaymentRequest: invoice,
+		Amt:            payReq.NumSatoshis,
+		FeeLimitSat:    maxFeeSats,
+		TimeoutSeconds: 60,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait for payment to complete
+	for {
+		payment, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if payment.Status == lnrpc.Payment_SUCCEEDED {
+			// PaymentHash is hex string, decode to bytes
+			hashBytes, err := hex.DecodeString(payment.PaymentHash)
+			if err != nil {
+				return nil, err
+			}
+			return hashBytes, nil
+		}
+		if payment.Status == lnrpc.Payment_FAILED {
+			return nil, errors.New(payment.FailureReason.String())
+		}
+	}
+	return nil, ErrPaymentFailed
 }
 
 func (s *Service) GetPaymentStatus(ctx context.Context, paymentHash []byte) (string, error) {
-	s.log.Info().Str("payment_hash", string(paymentHash)).Msg("GetPaymentStatus called (stub)")
-	return "succeeded", nil
+	// Use router's TrackPaymentV2 to get payment status
+	stream, err := s.routerClient.TrackPaymentV2(ctx, &routerrpc.TrackPaymentRequest{
+		PaymentHash: paymentHash,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	for {
+		payment, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		return payment.Status.String(), nil
+	}
+	return "unknown", nil
 }
 
 func (s *Service) GetChannelBalance(ctx context.Context) (int64, error) {
-	return 1000000, nil
+	resp, err := s.lightningClient.ChannelBalance(ctx, &lnrpc.ChannelBalanceRequest{})
+	if err != nil {
+		return 0, err
+	}
+	return int64(resp.LocalBalance.Sat), nil
 }
 
 func (s *Service) GetWalletBalance(ctx context.Context) (int64, error) {
-	return 1000000, nil
+	resp, err := s.lightningClient.WalletBalance(ctx, &lnrpc.WalletBalanceRequest{})
+	if err != nil {
+		return 0, err
+	}
+	return int64(resp.TotalBalance), nil
 }
 
-func (s *Service) DecodePayReq(ctx context.Context, payReq string) (interface{}, error) {
-	return nil, nil
+func (s *Service) DecodePayReq(ctx context.Context, payReq string) (*lnrpc.PayReq, error) {
+	return s.lightningClient.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: payReq})
 }
 
 func (s *Service) HealthCheck(ctx context.Context) error {
-	return nil
+	_, err := s.lightningClient.GetInfo(ctx, &lnrpc.GetInfoRequest{})
+	return err
 }

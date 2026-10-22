@@ -28,6 +28,8 @@ services:
       "-txindex=1",
       "-rpcuser=satlight",
       "-rpcpassword=satlight",
+      "-rpcallowip=0.0.0.0/0",
+      "-rpcbind=0.0.0.0",
       "-zmqpubrawblock=tcp://0.0.0.0:28332",
       "-zmqpubrawtx=tcp://0.0.0.0:28333"
     ]
@@ -43,25 +45,25 @@ services:
       retries: 5
 
   lnd:
-    image: lightninglabs/lnd:v0.18.0-beta
+    image: lightninglabs/lnd:v0.21.4-beta
     container_name: satlight-lnd
     command: [
-      "--bitcoin.regtest=1",
-      "--bitcoin.active=1",
+      "--bitcoin.regtest",
+      "--bitcoin.active",
       "--bitcoin.node=bitcoind",
       "--bitcoind.rpcuser=satlight",
       "--bitcoind.rpcpass=satlight",
+      "--bitcoind.rpchost=bitcoind:18443",
       "--bitcoind.zmqpubrawblock=tcp://bitcoind:28332",
       "--bitcoind.zmqpubrawtx=tcp://bitcoind:28333",
-      "--lnd.externalip=localhost",
-      "--lnd.listen=0.0.0.0:9735",
-      "--lnd.rpclisten=0.0.0.0:10009",
-      "--lnd.restlisten=0.0.0.0:8080",
-      "--lnd.tlsextradomain=localhost",
-      "--lnd.no-macaroons=false",
-      "--lnd.macaroonpath=/data/chain/bitcoin/regtest/admin.macaroon",
-      "--lnd.invoicemacaroonpath=/data/chain/bitcoin/regtest/invoice.macaroon",
-      "--lnd.paymentmacaroonpath=/data/chain/bitcoin/regtest/payment.macaroon"
+      "--externalip=localhost",
+      "--listen=0.0.0.0:9735",
+      "--rpclisten=0.0.0.0:10009",
+      "--restlisten=0.0.0.0:8080",
+      "--tlsextradomain=localhost",
+      "--adminmacaroonpath=/data/chain/bitcoin/regtest/admin.macaroon",
+      "--invoicemacaroonpath=/data/chain/bitcoin/regtest/invoice.macaroon",
+      "--readonlymacaroonpath=/data/chain/bitcoin/regtest/readonly.macaroon"
     ]
     ports:
       - "9735:9735"
@@ -82,22 +84,25 @@ services:
       retries: 10
 
   lnd-contributor:
-    image: lightninglabs/lnd:v0.18.0-beta
+    image: lightninglabs/lnd:v0.21.4-beta
     container_name: satlight-lnd-contributor
     command: [
-      "--bitcoin.regtest=1",
-      "--bitcoin.active=1",
+      "--bitcoin.regtest",
+      "--bitcoin.active",
       "--bitcoin.node=bitcoind",
       "--bitcoind.rpcuser=satlight",
       "--bitcoind.rpcpass=satlight",
+      "--bitcoind.rpchost=bitcoind:18443",
       "--bitcoind.zmqpubrawblock=tcp://bitcoind:28332",
       "--bitcoind.zmqpubrawtx=tcp://bitcoind:28333",
-      "--lnd.externalip=localhost",
-      "--lnd.listen=0.0.0.0:9736",
-      "--lnd.rpclisten=0.0.0.0:10010",
-      "--lnd.restlisten=0.0.0.0:8082",
-      "--lnd.tlsextradomain=localhost",
-      "--lnd.no-macaroons=false"
+      "--externalip=localhost",
+      "--listen=0.0.0.0:9736",
+      "--rpclisten=0.0.0.0:10010",
+      "--restlisten=0.0.0.0:8082",
+      "--tlsextradomain=localhost",
+      "--adminmacaroonpath=/data/chain/bitcoin/regtest/admin.macaroon",
+      "--invoicemacaroonpath=/data/chain/bitcoin/regtest/invoice.macaroon",
+      "--readonlymacaroonpath=/data/chain/bitcoin/regtest/readonly.macaroon"
     ]
     ports:
       - "9736:9736"
@@ -129,7 +134,7 @@ services:
       - LND_HOST=lnd:10009
       - LND_TLS_CERT=/data/tls.cert
       - LND_INVOICE_MACAROON=/data/chain/bitcoin/regtest/invoice.macaroon
-      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/payment.macaroon
+      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/admin.macaroon
       - PLATFORM_FEE_BPS=200
       - BOUNTY_DEFAULT_EXPIRY_DAYS=90
       - CLAIM_EXPIRY_DAYS=7
@@ -161,7 +166,7 @@ services:
       - LND_HOST=lnd:10009
       - LND_TLS_CERT=/data/tls.cert
       - LND_INVOICE_MACAROON=/data/chain/bitcoin/regtest/invoice.macaroon
-      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/payment.macaroon
+      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/admin.macaroon
       - PLATFORM_FEE_BPS=200
       - PAYOUTS_PAUSED=false
       - LOG_LEVEL=debug
