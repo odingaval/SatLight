@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"math"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -13,7 +15,9 @@ import (
 )
 
 var (
-	ErrLedgerImbalance = errors.New("ledger entries do not balance")
+	ErrLedgerImbalance    = errors.New("ledger entries do not balance")
+	ErrInvalidLedgerEntry = errors.New("invalid ledger entry")
+	ErrTooFewEntries      = errors.New("at least two entries required")
 )
 
 type Service struct {
@@ -30,31 +34,16 @@ func NewService(cfg interface{}, pool *pgxpool.Pool) *Service {
 }
 
 type Entry struct {
-	Account     string
-	Direction   string
-	AmountSats  int64
-	RefType     string
-	RefID       int64
+	Account    string
+	Direction  string
+	AmountSats int64
+	RefType    string
+	RefID      int64
 }
 
 func (s *Service) RecordTransaction(ctx context.Context, tx pgx.Tx, entries []Entry) error {
-	if len(entries) < 2 {
-		return errors.New("at least two entries required")
-	}
-
-	var totalDebits, totalCredits int64
-	for _, e := range entries {
-		if e.Direction == "debit" {
-			totalDebits += e.AmountSats
-		} else if e.Direction == "credit" {
-			totalCredits += e.AmountSats
-		} else {
-			return errors.New("invalid direction: " + e.Direction)
-		}
-	}
-
-	if totalDebits != totalCredits {
-		return ErrLedgerImbalance
+	if err := validateEntries(entries); err != nil {
+		return err
 	}
 
 	txID := uuid.New()
@@ -68,6 +57,38 @@ func (s *Service) RecordTransaction(ctx context.Context, tx pgx.Tx, entries []En
 		}
 	}
 
+	return nil
+}
+
+func validateEntries(entries []Entry) error {
+	if len(entries) < 2 {
+		return ErrTooFewEntries
+	}
+
+	var totalDebits, totalCredits int64
+	for _, entry := range entries {
+		if entry.AmountSats <= 0 {
+			return ErrInvalidLedgerEntry
+		}
+		switch entry.Direction {
+		case "debit":
+			if totalDebits > math.MaxInt64-entry.AmountSats {
+				return fmt.Errorf("%w: debit total overflow", ErrInvalidLedgerEntry)
+			}
+			totalDebits += entry.AmountSats
+		case "credit":
+			if totalCredits > math.MaxInt64-entry.AmountSats {
+				return fmt.Errorf("%w: credit total overflow", ErrInvalidLedgerEntry)
+			}
+			totalCredits += entry.AmountSats
+		default:
+			return fmt.Errorf("%w: unknown direction %q", ErrInvalidLedgerEntry, entry.Direction)
+		}
+	}
+
+	if totalDebits != totalCredits {
+		return ErrLedgerImbalance
+	}
 	return nil
 }
 
