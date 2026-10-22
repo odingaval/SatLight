@@ -141,7 +141,7 @@ Targets (first 6 months): 5 funded projects, 100 funded bounties before public l
 ```
 
 **Components**
-- **Web frontend:** server-rendered or lightweight SPA (**[ASSUMPTION]** SvelteKit or Next.js; pick in ADR-005).
+- **Web frontend:** Vite-served TypeScript app with static HTML; use htmx for progressive server-driven interactions where useful.
 - **Go API:** REST/JSON, OpenAPI-described; auth, bounty CRUD, webhooks.
 - **Workers:** durable job processing for payouts, retries, claim expiry, reconciliation.
 - **PostgreSQL:** system of record; ledger entries are append-only.

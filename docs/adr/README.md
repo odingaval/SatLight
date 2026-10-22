@@ -6,7 +6,7 @@
 | 002 | Lightning implementation | Proposed |
 | 003 | Primary database | Accepted |
 | 004 | Job queue | Proposed |
-| 005 | Frontend stack | Open |
+| 005 | Frontend stack | Accepted |
 | 006 | GitHub App | Accepted |
 | 007 | Payout destination | Proposed |
 | 008 | Hosting | Open |

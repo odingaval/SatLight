@@ -6,7 +6,7 @@ Every merged pull request deserves instant Bitcoin.
 
 Maintainers fund a repository with Bitcoin and publish small tasks. Contributors claim a task, open a pull request, and receive sats over the Lightning Network within seconds of the merge. No banks, no invoices, no payment processors.
 
-> **Status:** Early development (pre-M1). Not production ready. Do not use with funds you cannot afford to lose.
+> **Status:** M1 foundations in progress. Not production ready. Do not use with funds you cannot afford to lose.
 
 ---
 
@@ -26,7 +26,7 @@ Thousands of small but valuable contributions (docs fixes, minor bugs, tests, tr
 
 | Milestone | Deliverable | Status |
 |---|---|---|
-| M1 | Landing page, project registration, contributor waitlist | Planned |
+| M1 | Landing page, project registration, contributor waitlist | In progress |
 | M2 | Create and fund bounties | Planned |
 | M3 | GitHub pull request and merge verification | Planned |
 | M4 | Automated Lightning payouts and closed beta (5 projects) | Planned |
@@ -37,7 +37,7 @@ Thousands of small but valuable contributions (docs fixes, minor bugs, tests, tr
 - **Database:** PostgreSQL
 - **Lightning:** LND (default, see ADR-002)
 - **Source control integration:** GitHub App (webhooks + REST API)
-- **Frontend:** htmx + Alpine.js (server-rendered Go templates)
+- **Frontend:** Vite + TypeScript, with htmx available for progressive enhancement
 
 ## Quick start
 
@@ -60,8 +60,15 @@ make dev                    # API + workers + Postgres + regtest bitcoind + 2 LN
 make seed                   # load sample projects and bounties
 ```
 
-The app runs at `http://localhost:8080` by default.
-The web UI runs at `http://localhost:3000`.
+In a second terminal, start the web UI:
+
+```bash
+cd web
+npm ci
+npm run dev
+```
+
+The API runs at `http://localhost:8080`; the web UI runs at `http://localhost:3000` and proxies API requests locally. To enable GitHub sign-in and project registration, configure the GitHub App's OAuth client ID and secret in `.env` and set its callback URL to `http://localhost:8080/api/v1/auth/github/callback`.
 
 ### Common commands
 
@@ -87,8 +94,10 @@ Key environment variables (full list in `.env.example`):
 | Variable | Description |
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string |
-| `LND_HOST` / `LND_TLS_CERT` / `LND_MACAROON_PATH` | Lightning node connection |
-| `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` | GitHub App credentials |
+| `BASE_URL` / `WEB_URL` | API callback origin and web UI origin |
+| `LND_HOST` / `LND_TLS_CERT` / `LND_INVOICE_MACAROON` / `LND_PAYMENT_MACAROON` | Lightning node connection |
+| `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY_PATH` | GitHub App credentials |
+| `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` | GitHub sign-in for project registration |
 | `GITHUB_WEBHOOK_SECRET` | Webhook signature verification |
 | `PLATFORM_FEE_BPS` | Platform fee in basis points (default `200` = 2%) |
 | `NETWORK` | `regtest`, `signet`, `testnet`, or `mainnet` |
@@ -100,7 +109,7 @@ Key environment variables (full list in `.env.example`):
 ├── cmd/            # entrypoints (api, worker, migrate, seed)
 ├── internal/       # application code (bounties, ledger, lightning, github)
 ├── migrations/     # database migrations
-├── web/            # frontend (htmx + Alpine.js)
+├── web/            # Vite + TypeScript frontend
 ├── docs/           # all documentation
 │   ├── adr/            # architecture decision records
 │   ├── specs/          # technical specifications (API, state machine, etc.)

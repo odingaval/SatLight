@@ -4,7 +4,7 @@ help:
 	@echo "Satlight - Bitcoin-native marketplace for open-source contributions"
 	@echo ""
 	@echo "Available commands:"
-	@echo "  dev           Start local development environment (API + worker + DB + Lightning)"
+	@echo "  dev           Start API + worker + DB + Lightning (start web separately in web/)"
 	@echo "  seed          Load sample projects and bounties"
 	@echo "  test          Run unit tests"
 	@echo "  test-int      Run integration tests (requires containers)"
@@ -72,7 +72,7 @@ docker-build:
 
 docker-up:
 	docker compose up -d
-	@echo "Services started. API at http://localhost:8080, Web at http://localhost:3000"
+	@echo "Services started. API at http://localhost:8080. Start the web UI with 'cd web && npm run dev'."
 
 docker-down:
 	docker compose down -v
