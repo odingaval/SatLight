@@ -1,5 +1,6 @@
 import './styles/main.css'
 import 'htmx.org'
+import { renderExtraPage } from './pages'
 
 type User = { github_login: string }
 
@@ -7,11 +8,15 @@ const app = document.querySelector<HTMLDivElement>('#app')
 
 if (!app) throw new Error('App root is missing')
 
+const handledPage = renderExtraPage(app, window.location.pathname)
+if (!handledPage) {
+
 app.innerHTML = `
   <header class="site-header">
     <div class="container nav">
       <a class="nav-brand" href="#top" aria-label="Satlight home"><span class="brand-mark">₿</span> satlight</a>
       <nav class="nav-links" aria-label="Main navigation">
+        <a class="nav-link" href="/bounties">Browse bounties</a>
         <a class="nav-link" href="#how-it-works">How it works</a>
         <a class="nav-link" href="#for-projects">For projects</a>
         <a class="btn btn-dark nav-cta" href="#join">Join the waitlist <span aria-hidden="true">↗</span></a>
@@ -64,7 +69,7 @@ app.innerHTML = `
     </section>
 
     <section class="project-section" id="for-projects"><div class="container project-grid">
-      <div class="project-copy"><p class="eyebrow">FOR MAINTAINERS</p><h2>Make room for<br>the work that <span>matters.</span></h2><p>Turn your good-first-issue backlog into real opportunities. Fund tasks with Bitcoin and invite contributors everywhere to help.</p><ul class="check-list"><li><span>✓</span> Keep issues and pull requests on GitHub</li><li><span>✓</span> Set clear rewards for useful work</li><li><span>✓</span> Reach contributors around the world</li></ul><a class="btn btn-dark btn-large" href="#register">Register a project <span aria-hidden="true">→</span></a></div>
+      <div class="project-copy"><p class="eyebrow">FOR MAINTAINERS</p><h2>Make room for<br>the work that <span>matters.</span></h2><p>Turn your good-first-issue backlog into real opportunities. Fund tasks with Bitcoin and invite contributors everywhere to help.</p><ul class="check-list"><li><span>✓</span> Keep issues and pull requests on GitHub</li><li><span>✓</span> Set clear rewards for useful work</li><li><span>✓</span> Reach contributors around the world</li></ul><a class="btn btn-dark btn-large" href="#register">Register a project <span aria-hidden="true">→</span></a><p><a class="maintainer-preview-link" href="/dashboard-preview">Preview the maintainer dashboard →</a></p></div>
       <div class="project-visual"><div class="repo-window"><div class="window-top"><span></span><span></span><span></span><b>northstar / project</b></div><div class="repo-title"><span class="repo-avatar">N</span><div><strong>northstar</strong><small>Open source, moving forward.</small></div><span class="repo-public">PUBLIC</span></div><div class="repo-stats"><span>◉ &nbsp; 2.4k stars</span><span>⑂ &nbsp; 318 forks</span></div><div class="issue-row"><span class="issue-open">●</span><div><strong>Improve install docs for Linux</strong><small>#284 opened 2 days ago</small></div><span class="issue-reward">10k sats</span></div><div class="issue-row"><span class="issue-open">●</span><div><strong>Add Spanish translations</strong><small>#279 opened 5 days ago</small></div><span class="issue-reward">25k sats</span></div><div class="issue-row"><span class="issue-open">●</span><div><strong>Fix mobile navigation spacing</strong><small>#275 opened 1 week ago</small></div><span class="issue-reward">8k sats</span></div><div class="repo-foot"><span>✦ &nbsp; 3 tasks with rewards</span><span class="repo-foot-bolt">⚡</span></div></div><div class="floating-sat">₿<small> sats</small></div></div>
     </div></section>
 
@@ -135,13 +140,13 @@ function showProjectForm(user: User) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repo_full_name: String(fields.get('repo_full_name')).trim(), installation_id: Number(fields.get('installation_id')) }),
       })
-      const result = await response.json().catch(() => ({})) as { repo_full_name?: string; error?: { message?: string } }
+      const result = await response.json().catch(() => ({})) as { id?: number; repo_full_name?: string; error?: { message?: string } }
       if (response.status === 401) {
         showSignIn('Your session expired. Sign in again to register the repository.')
         return
       }
       if (!response.ok) throw new Error(result.error?.message ?? 'We could not register that repository. Check the name and installation ID.')
-      message.textContent = `${result.repo_full_name ?? 'Repository'} is registered. You’re ready for the next step.`
+      message.innerHTML = `${escapeHtml(result.repo_full_name ?? 'Repository')} is registered. ${result.id ? `<a href="/dashboard/${result.id}?repo=${encodeURIComponent(result.repo_full_name ?? '')}">Open project dashboard →</a>` : 'You’re ready for the next step.'}`
       message.className = 'register-message is-success'
       projectForm.reset()
     } catch (error) {
@@ -166,3 +171,4 @@ fetch('/api/v1/me').then(async (response) => {
   }
   showProjectForm(await response.json() as User)
 }).catch(() => showSignIn('The registration service is unavailable right now. You can still join the waitlist above.'))
+}
