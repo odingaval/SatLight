@@ -721,6 +721,10 @@ func (s *Server) handleCreateBounty(c *gin.Context) {
 
 	b, err := s.services.Bounty.CreateBounty(c.Request.Context(), params)
 	if err != nil {
+		if errors.Is(err, bounty.ErrInsufficientFunds) {
+			c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"code": "INSUFFICIENT_FUNDS", "message": "fund your project wallet before publishing this bounty"}})
+			return
+		}
 		s.logger.Error().Err(err).Msg("failed to create bounty")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to create bounty"}})
 		return

@@ -80,6 +80,11 @@ func (s *Service) CreateBounty(ctx context.Context, params CreateBountyParams) (
 	if params.RewardSats < s.cfg.MinRewardSats {
 		return nil, errors.New("reward below minimum")
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
 
 	expiresAt := params.ExpiresAt
 	if expiresAt == nil {
@@ -91,7 +96,7 @@ func (s *Service) CreateBounty(ctx context.Context, params CreateBountyParams) (
 	netPayoutSats := params.RewardSats - feeSats
 
 	var bounty Bounty
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO bounties (project_id, github_issue_number, title, description, difficulty, reward_sats, fee_sats, state, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', $8)
 		RETURNING id, project_id, github_issue_number, title, description, difficulty, reward_sats, fee_sats, state, expires_at, created_at
@@ -102,6 +107,28 @@ func (s *Service) CreateBounty(ctx context.Context, params CreateBountyParams) (
 	if err != nil {
 		return nil, err
 	}
+	var availableSats int64
+	if err := tx.QueryRow(ctx, `SELECT available_sats FROM wallets WHERE project_id = $1 FOR UPDATE`, params.ProjectID).Scan(&availableSats); err != nil {
+		return nil, err
+	}
+	if availableSats < params.RewardSats {
+		return nil, ErrInsufficientFunds
+	}
+	if _, err := tx.Exec(ctx, `UPDATE wallets SET available_sats = available_sats - $1, reserved_sats = reserved_sats + $1, updated_at = now() WHERE project_id = $2`, params.RewardSats, params.ProjectID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE bounties SET state = 'open', updated_at = now() WHERE id = $1`, bounty.ID); err != nil {
+		return nil, err
+	}
+	if s.ledger != nil {
+		if err := s.ledger.ReserveBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats, bounty.FeeSats); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	bounty.State = "open"
 	bounty.NetPayoutSats = netPayoutSats
 	return &bounty, nil
 }
