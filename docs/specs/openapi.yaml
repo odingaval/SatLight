@@ -8,6 +8,22 @@ servers:
 security:
   - session: []
 paths:
+  /auth/github:
+    get:
+      summary: Start GitHub sign-in
+      security: []
+      responses:
+        '302': { description: Redirect to GitHub OAuth }
+        '503': { description: GitHub OAuth is not configured }
+  /auth/github/callback:
+    get:
+      summary: Complete GitHub sign-in
+      security: []
+      parameters:
+        - { name: code, in: query, required: true, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
+      responses:
+        '302': { description: Redirect to the web app with a session cookie }
   /waitlist:
     post:
       summary: Join waitlist

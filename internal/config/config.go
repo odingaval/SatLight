@@ -9,33 +9,34 @@ import (
 )
 
 type Config struct {
-	AppEnv           string        `mapstructure:"APP_ENV"`
-	Network          string        `mapstructure:"NETWORK"`
-	HTTPAddr         string        `mapstructure:"HTTP_ADDR"`
-	BaseURL          string        `mapstructure:"BASE_URL"`
-	DatabaseURL      string        `mapstructure:"DATABASE_URL"`
-	LNDHost          string        `mapstructure:"LND_HOST"`
-	LNDTLSCert       string        `mapstructure:"LND_TLS_CERT"`
-	LNDInvoiceMacaroon string      `mapstructure:"LND_INVOICE_MACAROON"`
-	LNDPaymentMacaroon string      `mapstructure:"LND_PAYMENT_MACAROON"`
-	PayoutMaxFeePPM  int           `mapstructure:"PAYOUT_MAX_FEE_PPM"`
-	PayoutMaxFeeFloorSats int      `mapstructure:"PAYOUT_MAX_FEE_FLOOR_SATS"`
-	GitHubAppID      string        `mapstructure:"GITHUB_APP_ID"`
+	AppEnv                  string `mapstructure:"APP_ENV"`
+	Network                 string `mapstructure:"NETWORK"`
+	HTTPAddr                string `mapstructure:"HTTP_ADDR"`
+	BaseURL                 string `mapstructure:"BASE_URL"`
+	WebURL                  string `mapstructure:"WEB_URL"`
+	DatabaseURL             string `mapstructure:"DATABASE_URL"`
+	LNDHost                 string `mapstructure:"LND_HOST"`
+	LNDTLSCert              string `mapstructure:"LND_TLS_CERT"`
+	LNDInvoiceMacaroon      string `mapstructure:"LND_INVOICE_MACAROON"`
+	LNDPaymentMacaroon      string `mapstructure:"LND_PAYMENT_MACAROON"`
+	PayoutMaxFeePPM         int    `mapstructure:"PAYOUT_MAX_FEE_PPM"`
+	PayoutMaxFeeFloorSats   int    `mapstructure:"PAYOUT_MAX_FEE_FLOOR_SATS"`
+	GitHubAppID             string `mapstructure:"GITHUB_APP_ID"`
 	GitHubAppPrivateKeyPath string `mapstructure:"GITHUB_APP_PRIVATE_KEY_PATH"`
-	GitHubWebhookSecret string     `mapstructure:"GITHUB_WEBHOOK_SECRET"`
-	GitHubOAuthClientID string     `mapstructure:"GITHUB_OAUTH_CLIENT_ID"`
-	GitHubOAuthClientSecret string  `mapstructure:"GITHUB_OAUTH_CLIENT_SECRET"`
-	PlatformFeeBPS   int           `mapstructure:"PLATFORM_FEE_BPS"`
+	GitHubWebhookSecret     string `mapstructure:"GITHUB_WEBHOOK_SECRET"`
+	GitHubOAuthClientID     string `mapstructure:"GITHUB_OAUTH_CLIENT_ID"`
+	GitHubOAuthClientSecret string `mapstructure:"GITHUB_OAUTH_CLIENT_SECRET"`
+	PlatformFeeBPS          int    `mapstructure:"PLATFORM_FEE_BPS"`
 	BountyDefaultExpiryDays int    `mapstructure:"BOUNTY_DEFAULT_EXPIRY_DAYS"`
-	ClaimExpiryDays  int           `mapstructure:"CLAIM_EXPIRY_DAYS"`
-	PayoutsPaused    bool          `mapstructure:"PAYOUTS_PAUSED"`
-	MinRewardSats    int64         `mapstructure:"MIN_REWARD_SATS"`
-	SessionSecret    string        `mapstructure:"SESSION_SECRET"`
-	EncryptionKey    string        `mapstructure:"ENCRYPTION_KEY"`
-	SMTPURL          string        `mapstructure:"SMTP_URL"`
-	EmailFrom        string        `mapstructure:"EMAIL_FROM"`
-	LogLevel         string        `mapstructure:"LOG_LEVEL"`
-	SentryDSN        string        `mapstructure:"SENTRY_DSN"`
+	ClaimExpiryDays         int    `mapstructure:"CLAIM_EXPIRY_DAYS"`
+	PayoutsPaused           bool   `mapstructure:"PAYOUTS_PAUSED"`
+	MinRewardSats           int64  `mapstructure:"MIN_REWARD_SATS"`
+	SessionSecret           string `mapstructure:"SESSION_SECRET"`
+	EncryptionKey           string `mapstructure:"ENCRYPTION_KEY"`
+	SMTPURL                 string `mapstructure:"SMTP_URL"`
+	EmailFrom               string `mapstructure:"EMAIL_FROM"`
+	LogLevel                string `mapstructure:"LOG_LEVEL"`
+	SentryDSN               string `mapstructure:"SENTRY_DSN"`
 }
 
 func Load() (*Config, error) {
@@ -46,6 +47,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("NETWORK", "regtest")
 	viper.SetDefault("HTTP_ADDR", ":8080")
 	viper.SetDefault("BASE_URL", "http://localhost:8080")
+	viper.SetDefault("WEB_URL", "http://localhost:3000")
 	viper.SetDefault("PLATFORM_FEE_BPS", 200)
 	viper.SetDefault("BOUNTY_DEFAULT_EXPIRY_DAYS", 90)
 	viper.SetDefault("CLAIM_EXPIRY_DAYS", 7)

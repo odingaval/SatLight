@@ -2,9 +2,13 @@ package api
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,12 +32,12 @@ type Server struct {
 }
 
 type Services struct {
-	Auth       *auth.Service
-	Bounty     *bounty.Service
-	Ledger     *ledger.Service
-	Lightning  *lightning.Service
-	GitHub     *github.Service
-	Queue      *queue.Client
+	Auth      *auth.Service
+	Bounty    *bounty.Service
+	Ledger    *ledger.Service
+	Lightning *lightning.Service
+	GitHub    *github.Service
+	Queue     *queue.Client
 }
 
 func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
@@ -42,19 +46,36 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
 	authSvc := auth.NewService(cfg, pool)
 	bountySvc := bounty.NewService(cfg, pool)
 	ledgerSvc := ledger.NewService(cfg, pool)
-	lightningSvc := lightning.NewService(cfg, pool)
-	githubSvc := github.NewService(cfg, pool)
+	lightningSvc := lightning.NewService(&lightning.Config{
+		Host:            cfg.LNDHost,
+		TLSCertPath:     cfg.LNDTLSCert,
+		InvoiceMacaroon: cfg.LNDInvoiceMacaroon,
+		PaymentMacaroon: cfg.LNDPaymentMacaroon,
+		MaxFeePPM:       int64(cfg.PayoutMaxFeePPM),
+		MaxFeeFloorSats: int64(cfg.PayoutMaxFeeFloorSats),
+	}, pool)
+	appID, err := strconv.ParseInt(cfg.GitHubAppID, 10, 64)
+	if err != nil && cfg.GitHubAppID != "" {
+		logger.Warn().Err(err).Msg("invalid GitHub App ID")
+	}
+	githubSvc := github.NewService(&github.Config{
+		AppID:             appID,
+		PrivateKeyPath:    cfg.GitHubAppPrivateKeyPath,
+		WebhookSecret:     cfg.GitHubWebhookSecret,
+		OAuthClientID:     cfg.GitHubOAuthClientID,
+		OAuthClientSecret: cfg.GitHubOAuthClientSecret,
+	}, pool)
 	queueClient := queue.NewClient(pool)
 
 	bountySvc.SetDependencies(ledgerSvc, queueClient)
 
 	services := &Services{
-		Auth:       authSvc,
-		Bounty:     bountySvc,
-		Ledger:     ledgerSvc,
-		Lightning:  lightningSvc,
-		GitHub:     githubSvc,
-		Queue:      queueClient,
+		Auth:      authSvc,
+		Bounty:    bountySvc,
+		Ledger:    ledgerSvc,
+		Lightning: lightningSvc,
+		GitHub:    githubSvc,
+		Queue:     queueClient,
 	}
 
 	router := gin.New()
@@ -85,6 +106,8 @@ func (s *Server) setupRoutes() {
 
 	v1 := s.router.Group("/api/v1")
 	{
+		v1.GET("/auth/github", s.handleGitHubLogin)
+		v1.GET("/auth/github/callback", s.handleGitHubCallback)
 		v1.POST("/waitlist", s.handleWaitlist)
 
 		v1.GET("/bounties", s.handleListBounties)
@@ -108,6 +131,68 @@ func (s *Server) setupRoutes() {
 
 		v1.POST("/webhooks/github", s.handleGitHubWebhook)
 	}
+}
+
+func (s *Server) handleGitHubLogin(c *gin.Context) {
+	if s.cfg.GitHubOAuthClientID == "" || s.cfg.GitHubOAuthClientSecret == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "GITHUB_OAUTH_UNAVAILABLE", "message": "GitHub sign-in is not configured"}})
+		return
+	}
+
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		s.logger.Error().Err(err).Msg("failed to create GitHub OAuth state")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not start GitHub sign-in"}})
+		return
+	}
+	state := base64.RawURLEncoding.EncodeToString(stateBytes)
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("github_oauth_state", state, 600, "/api/v1/auth/github", "", s.cfg.IsProduction(), true)
+	redirectURL := strings.TrimRight(s.cfg.BaseURL, "/") + "/api/v1/auth/github/callback"
+	c.Redirect(http.StatusFound, s.services.GitHub.GetOAuthURL(state, redirectURL))
+}
+
+func (s *Server) handleGitHubCallback(c *gin.Context) {
+	state, cookieErr := c.Cookie("github_oauth_state")
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("github_oauth_state", "", -1, "/api/v1/auth/github", "", s.cfg.IsProduction(), true)
+	if cookieErr != nil || c.Query("state") == "" || !hmac.Equal([]byte(state), []byte(c.Query("state"))) {
+		c.Redirect(http.StatusFound, strings.TrimRight(s.cfg.WebURL, "/")+"/?github=state_error#register")
+		return
+	}
+	if code := c.Query("code"); code == "" {
+		c.Redirect(http.StatusFound, strings.TrimRight(s.cfg.WebURL, "/")+"/?github=denied#register")
+		return
+	}
+
+	ctx := c.Request.Context()
+	redirectURL := strings.TrimRight(s.cfg.BaseURL, "/") + "/api/v1/auth/github/callback"
+	token, err := s.services.GitHub.ExchangeCode(ctx, c.Query("code"), redirectURL)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("GitHub OAuth code exchange failed")
+		c.Redirect(http.StatusFound, strings.TrimRight(s.cfg.WebURL, "/")+"/?github=failed#register")
+		return
+	}
+	githubUser, err := s.services.GitHub.GetUser(ctx, token)
+	if err != nil || githubUser.GetID() == 0 || githubUser.GetLogin() == "" {
+		s.logger.Warn().Err(err).Msg("failed to load GitHub user")
+		c.Redirect(http.StatusFound, strings.TrimRight(s.cfg.WebURL, "/")+"/?github=failed#register")
+		return
+	}
+	userID, err := s.services.Auth.UpsertUser(ctx, githubUser.GetID(), githubUser.GetLogin(), githubUser.GetEmail())
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to save GitHub user")
+		c.Redirect(http.StatusFound, strings.TrimRight(s.cfg.WebURL, "/")+"/?github=failed#register")
+		return
+	}
+	session, err := s.services.Auth.GenerateToken(userID)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to create user session")
+		c.Redirect(http.StatusFound, strings.TrimRight(s.cfg.WebURL, "/")+"/?github=failed#register")
+		return
+	}
+	s.services.Auth.SetSessionCookie(c, session)
+	c.Redirect(http.StatusFound, strings.TrimRight(s.cfg.WebURL, "/")+"/?github=connected#register")
 }
 
 func (s *Server) authRequired() gin.HandlerFunc {
@@ -200,8 +285,8 @@ func (s *Server) handleListBounties(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"items":        bounties,
-		"next_cursor":  nextCursor,
+		"items":       bounties,
+		"next_cursor": nextCursor,
 	})
 }
 
@@ -355,26 +440,31 @@ func (s *Server) handleCreateProject(c *gin.Context) {
 	}
 
 	var req struct {
-		RepoFullName     string `json:"repo_full_name" binding:"required"`
-		InstallationID   int64  `json:"installation_id" binding:"required"`
+		RepoFullName   string `json:"repo_full_name" binding:"required"`
+		InstallationID int64  `json:"installation_id" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": err.Error()}})
 		return
 	}
 
-	isAdmin, err := s.services.GitHub.VerifyRepoAdmin(c.Request.Context(), req.InstallationID, userID, req.RepoFullName)
+	_, githubLogin, _, _, err := s.services.Auth.GetUserByID(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "could not load the signed-in GitHub user"}})
+		return
+	}
+	isAdmin, err := s.services.GitHub.VerifyRepoAdmin(c.Request.Context(), req.InstallationID, githubLogin, req.RepoFullName)
 	if err != nil || !isAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "FORBIDDEN", "message": "not an admin of the repository"}})
 		return
 	}
 
 	var project struct {
-		ID                   int64     `json:"id"`
-		OwnerUserID          int64     `json:"owner_user_id"`
-		GitHubInstallationID int64     `json:"github_installation_id"`
-		RepoFullName         string    `json:"repo_full_name"`
-		Status               string    `json:"status"`
+		ID                   int64  `json:"id"`
+		OwnerUserID          int64  `json:"owner_user_id"`
+		GitHubInstallationID int64  `json:"github_installation_id"`
+		RepoFullName         string `json:"repo_full_name"`
+		Status               string `json:"status"`
 	}
 	err = s.pool.QueryRow(c.Request.Context(), `
 		INSERT INTO projects (owner_user_id, github_installation_id, repo_full_name)
@@ -492,7 +582,7 @@ func (s *Server) handleCreateWithdrawal(c *gin.Context) {
 	}
 
 	var req struct {
-		AmountSats int64  `json:"amount_sats" binding:"required,min=1"`
+		AmountSats  int64  `json:"amount_sats" binding:"required,min=1"`
 		Destination string `json:"destination" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -535,11 +625,11 @@ func (s *Server) handleCreateBounty(c *gin.Context) {
 	}
 
 	var req struct {
-		GitHubIssueNumber int    `json:"github_issue_number" binding:"required"`
-		Title             string `json:"title" binding:"required,max=140"`
-		Description       string `json:"description" binding:"required"`
-		Difficulty        string `json:"difficulty" binding:"required,oneof=trivial easy medium hard"`
-		RewardSats        int64  `json:"reward_sats" binding:"required,min=500"`
+		GitHubIssueNumber int     `json:"github_issue_number" binding:"required"`
+		Title             string  `json:"title" binding:"required,max=140"`
+		Description       string  `json:"description" binding:"required"`
+		Difficulty        string  `json:"difficulty" binding:"required,oneof=trivial easy medium hard"`
+		RewardSats        int64   `json:"reward_sats" binding:"required,min=500"`
 		ExpiresAt         *string `json:"expires_at"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -589,11 +679,11 @@ func (s *Server) handleGetMe(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"id":                 userID,
-		"github_id":          githubID,
-		"github_login":       login,
-		"email":              email,
-		"lightning_address":  lightningAddress,
+		"id":                userID,
+		"github_id":         githubID,
+		"github_login":      login,
+		"email":             email,
+		"lightning_address": lightningAddress,
 	})
 }
 
@@ -661,13 +751,13 @@ func (s *Server) handleGetPayouts(c *gin.Context) {
 			continue
 		}
 		payouts = append(payouts, map[string]interface{}{
-			"id":            p.ID,
-			"bounty_id":     p.BountyID,
-			"amount_sats":   p.AmountSats,
-			"fee_sats":      p.FeeSats,
-			"status":        p.Status,
-			"settled_at":    p.SettledAt,
-			"title":         p.Title,
+			"id":             p.ID,
+			"bounty_id":      p.BountyID,
+			"amount_sats":    p.AmountSats,
+			"fee_sats":       p.FeeSats,
+			"status":         p.Status,
+			"settled_at":     p.SettledAt,
+			"title":          p.Title,
 			"repo_full_name": p.RepoFullName,
 		})
 	}
@@ -692,11 +782,11 @@ func (s *Server) handleRedeemPayoutClaim(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"callback_url": "https://example.com/lnurl-withdraw", // placeholder
-		"k1":           claimLink,
-		"tag":          "withdrawRequest",
-		"minWithdrawable": 1000,
-		"maxWithdrawable": 100000000,
+		"callback_url":       "https://example.com/lnurl-withdraw", // placeholder
+		"k1":                 claimLink,
+		"tag":                "withdrawRequest",
+		"minWithdrawable":    1000,
+		"maxWithdrawable":    100000000,
 		"defaultDescription": "Satlight payout",
 	})
 }

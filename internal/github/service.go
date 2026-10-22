@@ -35,10 +35,10 @@ type Service struct {
 }
 
 type Config struct {
-	AppID            int64
-	PrivateKeyPath   string
-	WebhookSecret    string
-	OAuthClientID    string
+	AppID             int64
+	PrivateKeyPath    string
+	WebhookSecret     string
+	OAuthClientID     string
 	OAuthClientSecret string
 }
 
@@ -208,7 +208,7 @@ func getClaimUserID(ctx context.Context, tx pgx.Tx, claimID int64) int64 {
 	return userID
 }
 
-func (s *Service) VerifyRepoAdmin(ctx context.Context, installationID int64, userID int64, repoFullName string) (bool, error) {
+func (s *Service) VerifyRepoAdmin(ctx context.Context, installationID int64, githubLogin string, repoFullName string) (bool, error) {
 	client, err := s.GetInstallationClient(installationID)
 	if err != nil {
 		return false, err
@@ -224,7 +224,7 @@ func (s *Service) VerifyRepoAdmin(ctx context.Context, installationID int64, use
 		return false, err
 	}
 
-	perm, _, err := client.Repositories.GetPermissionLevel(ctx, parts[0], parts[1], "")
+	perm, _, err := client.Repositories.GetPermissionLevel(ctx, parts[0], parts[1], githubLogin)
 	if err != nil {
 		return false, err
 	}
@@ -236,22 +236,23 @@ var oauth2Endpoint = oauth2.Endpoint{
 	TokenURL: "https://github.com/login/oauth/access_token",
 }
 
-func (s *Service) GetOAuthURL(state string) string {
+func (s *Service) GetOAuthURL(state, redirectURL string) string {
 	config := &oauth2.Config{
 		ClientID:     s.cfg.OAuthClientID,
 		ClientSecret: s.cfg.OAuthClientSecret,
 		Endpoint:     oauth2Endpoint,
-		RedirectURL:  "",
+		RedirectURL:  redirectURL,
 		Scopes:       []string{"read:user", "user:email"},
 	}
 	return config.AuthCodeURL(state, oauth2.AccessTypeOnline)
 }
 
-func (s *Service) ExchangeCode(ctx context.Context, code string) (*oauth2.Token, error) {
+func (s *Service) ExchangeCode(ctx context.Context, code, redirectURL string) (*oauth2.Token, error) {
 	config := &oauth2.Config{
 		ClientID:     s.cfg.OAuthClientID,
 		ClientSecret: s.cfg.OAuthClientSecret,
 		Endpoint:     oauth2Endpoint,
+		RedirectURL:  redirectURL,
 	}
 	return config.Exchange(ctx, code)
 }

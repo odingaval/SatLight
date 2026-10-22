@@ -95,7 +95,8 @@ func (s *Service) GenerateToken(userID int64) (string, error) {
 }
 
 func (s *Service) SetSessionCookie(c *gin.Context, token string) {
-	c.SetCookie("satlight_session", token, 30*24*3600, "/", "", false, true)
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("satlight_session", token, 30*24*3600, "/", "", s.cfg.IsProduction(), true)
 }
 
 func (s *Service) ClearSessionCookie(c *gin.Context) {
@@ -139,7 +140,7 @@ func (s *Service) GetUserByGitHubID(ctx context.Context, githubID int64) (int64,
 func (s *Service) GetUserByID(ctx context.Context, userID int64) (int64, string, string, string, error) {
 	var githubID int64
 	var login, email, lightningAddress string
-	err := s.pool.QueryRow(ctx, `SELECT github_id, github_login, email, lightning_address FROM users WHERE id = $1`, userID).Scan(&githubID, &login, &email, &lightningAddress)
+	err := s.pool.QueryRow(ctx, `SELECT github_id, github_login, COALESCE(email, ''), COALESCE(lightning_address, '') FROM users WHERE id = $1`, userID).Scan(&githubID, &login, &email, &lightningAddress)
 	if err != nil {
 		return 0, "", "", "", err
 	}
