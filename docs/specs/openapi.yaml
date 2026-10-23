@@ -58,6 +58,7 @@ paths:
                 properties:
                   items: { type: array, items: { $ref: '#/components/schemas/Bounty' } }
                   next_cursor: { type: string, nullable: true }
+        '400': { description: Invalid pagination cursor }
   /bounties/{id}:
     get:
       summary: Bounty detail
@@ -120,17 +121,16 @@ paths:
       responses:
         '201': { description: Invoice, content: { application/json: { schema: { $ref: '#/components/schemas/Deposit' } } } }
         '200': { description: Existing invoice returned for an idempotent retry, content: { application/json: { schema: { $ref: '#/components/schemas/Deposit' } } } }
+        '409': { description: Idempotency key was already used with a different amount }
         '502': { description: Lightning node failed to create an invoice }
         '503': { description: Lightning invoice service is unavailable }
+        '500': { description: Invoice was created but deposit persistence failed }
   /projects/{id}/withdrawals:
     post:
-      summary: Withdraw unreserved funds
-      parameters: [ { $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
-      requestBody:
-        required: true
-        content: { application/json: { schema: { type: object, required: [amount_sats, destination], properties: { amount_sats: { type: integer }, destination: { type: string } } } } }
+      summary: Withdraw unreserved funds (currently unavailable)
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
       responses:
-        '202': { description: Withdrawal queued }
+        '501': { description: Project withdrawals are not implemented }
   /projects/{id}/bounties:
     post:
       summary: Create and fund a bounty
@@ -141,6 +141,7 @@ paths:
       responses:
         '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Bounty' } } } }
         '402': { description: Insufficient wallet balance }
+        '400': { description: Invalid or expired bounty expiry timestamp }
   /me:
     get:
       summary: Current user

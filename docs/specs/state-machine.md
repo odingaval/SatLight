@@ -6,10 +6,10 @@
 | draft | fund (wallet has balance) | open | Reserve `reward` in escrow (ledger) |
 | draft | cancel | cancelled | none |
 | open | claim | claimed | Create active claim with expiry |
-| open | expiry | expired -> cancelled | Release reserved funds |
+| open | expiry | expired | Release reserved funds to project wallet and audit |
 | open | cancel | cancelled | Release reserved funds |
 | claimed | PR linked | in_review | Link PR to claim |
-| claimed | claim expires / release | open | Claim marked expired/released |
+| claimed | claim expires / release | open | Claim marked expired/released; if bounty itself has expired, refund reservation and expire bounty |
 | in_review | PR merged and verified | merged | Enqueue payout |
 | in_review | PR closed unmerged | claimed | none |
 | merged | payout settled | paid | Ledger: payout + fee |

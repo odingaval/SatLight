@@ -11,6 +11,7 @@
 
 ## Architecture and engineering
 - `adr/` decision records
+- `M2_COMPLETION_GUIDE.md`: M2 concepts, completion checklist, and current gaps
 - `specs/state-machine.md`, `specs/ledger-and-accounting.md`
 - `specs/lightning-integration.md`, `specs/github-integration.md`
 - `specs/notifications.md`, `specs/reputation-system.md`, `specs/analytics-plan.md`
