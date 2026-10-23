@@ -6,7 +6,7 @@ Every merged pull request deserves instant Bitcoin.
 
 Maintainers fund a repository with Bitcoin and publish small tasks. Contributors claim a task, open a pull request, and receive sats over the Lightning Network within seconds of the merge. No banks, no invoices, no payment processors.
 
-> **Status:** M1 foundations in progress. Not production ready. Do not use with funds you cannot afford to lose.
+> **Status:** M1 foundations (audit outstanding) and M2 funding are in progress. Not production ready. Do not use with funds you cannot afford to lose.
 
 ---
 
@@ -27,7 +27,7 @@ Thousands of small but valuable contributions (docs fixes, minor bugs, tests, tr
 | Milestone | Deliverable | Status |
 |---|---|---|
 | M1 | Landing page, project registration, contributor waitlist | In progress |
-| M2 | Create and fund bounties | Planned |
+| M2 | Create and fund bounties | In progress |
 | M3 | GitHub pull request and merge verification | Planned |
 | M4 | Automated Lightning payouts and closed beta (5 projects) | Planned |
 

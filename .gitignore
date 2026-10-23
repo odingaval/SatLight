@@ -9,6 +9,7 @@ dev/
 
 # Go build outputs
 bin/
+api
 *.exe
 *.test
 *.prof
@@ -50,6 +51,11 @@ mock_*.go
 tmp/
 temp/
 *.tmp
+
+# Local implementation notes
+docs/guides/BACKEND_IMPLEMENTATION.md
+.tmp-go-cache/
+.tmp-go-build/
 
 # Certificates and keys (if accidentally placed outside dev/)
 *.pem

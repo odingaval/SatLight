@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -422,7 +423,7 @@ func (s *Service) CancelBounty(ctx context.Context, bountyID, projectID int64) (
 		return nil, err
 	}
 
-	if bounty.State != "open" && bounty.State != "claimed" {
+	if !canCancelBounty(bounty.State) {
 		return nil, ErrInvalidState
 	}
 
@@ -441,6 +442,12 @@ func (s *Service) CancelBounty(ctx context.Context, bountyID, projectID int64) (
 			return nil, err
 		}
 	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_log (actor, action, subject, metadata)
+		VALUES ($1, 'bounty.cancelled', $2, jsonb_build_object('refund_sats', $3))
+	`, "project:"+strconv.FormatInt(projectID, 10), "bounty:"+strconv.FormatInt(bountyID, 10), bounty.RewardSats); err != nil {
+		return nil, err
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -448,6 +455,10 @@ func (s *Service) CancelBounty(ctx context.Context, bountyID, projectID int64) (
 
 	bounty.State = "cancelled"
 	return &bounty, nil
+}
+
+func canCancelBounty(state string) bool {
+	return state == "open"
 }
 
 func (s *Service) DisputeBounty(ctx context.Context, bountyID, userID int64, reason, evidence string) error {
