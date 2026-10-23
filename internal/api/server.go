@@ -323,6 +323,10 @@ func (s *Server) handleListBounties(c *gin.Context) {
 
 	bounties, nextCursor, err := s.services.Bounty.ListBounties(c.Request.Context(), filters)
 	if err != nil {
+		if errors.Is(err, bounty.ErrInvalidCursor) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_CURSOR", "message": "invalid bounty cursor"}})
+			return
+		}
 		s.logger.Error().Err(err).Msg("failed to list bounties")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to list bounties"}})
 		return
@@ -594,37 +598,39 @@ func (s *Server) handleCreateDeposit(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_IDEMPOTENCY_KEY", "message": "Idempotency-Key must contain 8 to 128 characters"}})
 		return
 	}
-	if existing, err := s.services.Bounty.GetDepositByIdempotencyKey(c.Request.Context(), project.ID, idempotencyKey); err != nil {
-		s.logger.Error().Err(err).Msg("failed to look up idempotent deposit")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not check existing invoice"}})
-		return
-	} else if existing != nil {
-		c.JSON(http.StatusOK, existing)
-		return
-	}
-
-	if !s.services.Lightning.Connected() {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "LIGHTNING_UNAVAILABLE", "message": "Lightning invoice service is unavailable"}})
-		return
-	}
-	expiresAt := time.Now().Add(time.Hour)
-	bolt11, paymentHash, err := s.services.Lightning.CreateInvoice(c.Request.Context(), req.AmountSats, "Satlight project wallet funding", time.Hour)
+	var invoiceCreationErr error
+	var lightningUnavailable bool
+	deposit, created, err := s.services.Bounty.GetOrCreateDeposit(c.Request.Context(), project.ID, idempotencyKey, req.AmountSats, func(ctx context.Context) (string, []byte, time.Time, error) {
+		if !s.services.Lightning.Connected() {
+			lightningUnavailable = true
+			return "", nil, time.Time{}, errors.New("lightning invoice service is unavailable")
+		}
+		bolt11, paymentHash, err := s.services.Lightning.CreateInvoice(ctx, req.AmountSats, "Satlight project wallet funding", time.Hour)
+		invoiceCreationErr = err
+		return bolt11, paymentHash, time.Now().Add(time.Hour), err
+	})
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to create Lightning invoice")
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "INVOICE_CREATION_FAILED", "message": "could not create Lightning invoice"}})
-		return
-	}
-	deposit, err := s.services.Bounty.CreateDeposit(c.Request.Context(), project.ID, idempotencyKey, bolt11, paymentHash, req.AmountSats, expiresAt)
-	if err != nil {
+		if errors.Is(err, bounty.ErrIdempotencyConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "IDEMPOTENCY_KEY_REUSED", "message": "Idempotency-Key was already used with a different amount"}})
+			return
+		}
 		s.logger.Error().Err(err).Msg("failed to create deposit")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to create deposit"}})
+		if lightningUnavailable {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "LIGHTNING_UNAVAILABLE", "message": "Lightning invoice service is unavailable"}})
+			return
+		}
+		if invoiceCreationErr != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "INVOICE_CREATION_FAILED", "message": "could not create Lightning invoice"}})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to persist deposit"}})
 		return
 	}
-
-	deposit.Bolt11 = bolt11
-	deposit.PaymentHash = paymentHash
-
-	c.JSON(http.StatusCreated, deposit)
+	if created {
+		c.JSON(http.StatusCreated, deposit)
+	} else {
+		c.JSON(http.StatusOK, deposit)
+	}
 }
 
 func (s *Server) handleCreateWithdrawal(c *gin.Context) {
@@ -640,34 +646,12 @@ func (s *Server) handleCreateWithdrawal(c *gin.Context) {
 		return
 	}
 
-	project, err := s.getUserProject(c.Request.Context(), userID, id)
+	_, err = s.getUserProject(c.Request.Context(), userID, id)
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "FORBIDDEN", "message": "not authorized to withdraw from this project"}})
 		return
 	}
-
-	var req struct {
-		AmountSats  int64  `json:"amount_sats" binding:"required,min=1"`
-		Destination string `json:"destination" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": err.Error()}})
-		return
-	}
-
-	wallet, err := s.services.Bounty.GetWallet(c.Request.Context(), project.ID)
-	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to get wallet")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to get wallet"}})
-		return
-	}
-
-	if wallet.AvailableSats < req.AmountSats {
-		c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"code": "INSUFFICIENT_FUNDS", "message": "insufficient available balance"}})
-		return
-	}
-
-	c.JSON(http.StatusAccepted, gin.H{"message": "withdrawal queued"})
+	c.JSON(http.StatusNotImplemented, gin.H{"error": gin.H{"code": "WITHDRAWALS_UNAVAILABLE", "message": "project withdrawals are not implemented yet"}})
 }
 
 func (s *Server) handleCreateBounty(c *gin.Context) {
@@ -704,9 +688,12 @@ func (s *Server) handleCreateBounty(c *gin.Context) {
 
 	var expiresAt *time.Time
 	if req.ExpiresAt != nil {
-		if t, err := time.Parse(time.RFC3339, *req.ExpiresAt); err == nil {
-			expiresAt = &t
+		t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_EXPIRY", "message": "expires_at must be an RFC3339 timestamp"}})
+			return
 		}
+		expiresAt = &t
 	}
 
 	params := bounty.CreateBountyParams{
@@ -723,6 +710,10 @@ func (s *Server) handleCreateBounty(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, bounty.ErrInsufficientFunds) {
 			c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"code": "INSUFFICIENT_FUNDS", "message": "fund your project wallet before publishing this bounty"}})
+			return
+		}
+		if errors.Is(err, bounty.ErrInvalidExpiry) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_EXPIRY", "message": "expires_at must be in the future"}})
 			return
 		}
 		s.logger.Error().Err(err).Msg("failed to create bounty")

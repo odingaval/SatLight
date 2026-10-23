@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,6 +26,9 @@ var (
 	ErrNotAuthorized        = errors.New("not authorized")
 	ErrDepositNotFound      = errors.New("deposit not found")
 	ErrDepositUnderpaid     = errors.New("settled amount is below the invoice amount")
+	ErrInvalidCursor        = errors.New("invalid bounty cursor")
+	ErrInvalidExpiry        = errors.New("bounty expiry must be in the future")
+	ErrIdempotencyConflict  = errors.New("idempotency key was reused with different request data")
 )
 
 type Service struct {
@@ -78,6 +82,9 @@ type CreateBountyParams struct {
 }
 
 func (s *Service) CreateBounty(ctx context.Context, params CreateBountyParams) (*Bounty, error) {
+	if s.ledger == nil || s.queue == nil {
+		return nil, errors.New("bounty funding dependencies are not configured")
+	}
 	if params.RewardSats < s.cfg.MinRewardSats {
 		return nil, errors.New("reward below minimum")
 	}
@@ -92,8 +99,11 @@ func (s *Service) CreateBounty(ctx context.Context, params CreateBountyParams) (
 		exp := time.Now().Add(s.cfg.BountyDefaultExpiryDuration())
 		expiresAt = &exp
 	}
+	if !expiresAt.After(time.Now()) {
+		return nil, ErrInvalidExpiry
+	}
 
-	feeSats := (params.RewardSats * int64(s.cfg.PlatformFeeBPS)) / 10000
+	feeSats := calculatePlatformFee(params.RewardSats, s.cfg.PlatformFeeBPS)
 	netPayoutSats := params.RewardSats - feeSats
 
 	var bounty Bounty
@@ -121,10 +131,11 @@ func (s *Service) CreateBounty(ctx context.Context, params CreateBountyParams) (
 	if _, err := tx.Exec(ctx, `UPDATE bounties SET state = 'open', updated_at = now() WHERE id = $1`, bounty.ID); err != nil {
 		return nil, err
 	}
-	if s.ledger != nil {
-		if err := s.ledger.ReserveBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats, bounty.FeeSats); err != nil {
-			return nil, err
-		}
+	if err := s.ledger.ReserveBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats, bounty.FeeSats); err != nil {
+		return nil, err
+	}
+	if err := s.queue.InsertTx(ctx, tx, queue.BountyExpiryArgs{BountyID: bounty.ID}, river.InsertOpts{ScheduledAt: *expiresAt}); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -134,7 +145,18 @@ func (s *Service) CreateBounty(ctx context.Context, params CreateBountyParams) (
 	return &bounty, nil
 }
 
+func calculatePlatformFee(rewardSats int64, feeBPS int) int64 {
+	fee := rewardSats * int64(feeBPS) / 10000
+	if rewardSats > 0 && feeBPS > 0 && fee == 0 {
+		return 1
+	}
+	return fee
+}
+
 func (s *Service) FundBounty(ctx context.Context, bountyID, projectID int64) (*Bounty, error) {
+	if s.ledger == nil {
+		return nil, errors.New("ledger service is not configured")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -182,10 +204,8 @@ func (s *Service) FundBounty(ctx context.Context, bountyID, projectID int64) (*B
 
 	bounty.State = "open"
 
-	if s.ledger != nil {
-		if err := s.ledger.ReserveBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats, bounty.FeeSats); err != nil {
-			return nil, err
-		}
+	if err := s.ledger.ReserveBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats, bounty.FeeSats); err != nil {
+		return nil, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -215,51 +235,10 @@ func (s *Service) GetBounty(ctx context.Context, id int64) (*Bounty, error) {
 }
 
 func (s *Service) ListBounties(ctx context.Context, filters ListFilters) ([]*Bounty, string, error) {
-	query := `
-		SELECT b.id, b.project_id, b.github_issue_number, b.title, b.description, b.difficulty, b.reward_sats, b.fee_sats, b.state, b.expires_at, b.created_at, p.repo_full_name
-		FROM bounties b
-		JOIN projects p ON b.project_id = p.id
-		WHERE b.state = 'open' AND b.expires_at > now()
-	`
-	args := []interface{}{}
-	argIdx := 1
-
-	if filters.Query != "" {
-		query += ` AND (b.title ILIKE $` + string(rune(argIdx+'0')) + ` OR b.description ILIKE $` + string(rune(argIdx+'0')) + `)`
-		args = append(args, "%"+filters.Query+"%")
-		argIdx++
+	query, args, limit, err := buildListBountiesQuery(filters)
+	if err != nil {
+		return nil, "", err
 	}
-	if filters.Language != "" {
-		query += ` AND p.repo_full_name ILIKE $` + string(rune(argIdx+'0'))
-		args = append(args, "%"+filters.Language+"%")
-		argIdx++
-	}
-	if filters.Difficulty != "" {
-		query += ` AND b.difficulty = $` + string(rune(argIdx+'0'))
-		args = append(args, filters.Difficulty)
-		argIdx++
-	}
-	if filters.MinReward > 0 {
-		query += ` AND b.reward_sats >= $` + string(rune(argIdx+'0'))
-		args = append(args, filters.MinReward)
-		argIdx++
-	}
-	if filters.MaxReward > 0 {
-		query += ` AND b.reward_sats <= $` + string(rune(argIdx+'0'))
-		args = append(args, filters.MaxReward)
-		argIdx++
-	}
-
-	query += ` ORDER BY b.created_at DESC LIMIT $` + string(rune(argIdx+'0'))
-	args = append(args, filters.Limit+1)
-	argIdx++
-
-	if filters.Cursor != "" {
-		query += ` AND b.created_at < $` + string(rune(argIdx+'0'))
-		args = append(args, filters.Cursor)
-		argIdx++
-	}
-
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, "", err
@@ -276,14 +255,90 @@ func (s *Service) ListBounties(ctx context.Context, filters ListFilters) ([]*Bou
 		b.NetPayoutSats = b.RewardSats - b.FeeSats
 		bounties = append(bounties, &b)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
 
 	var nextCursor string
-	if len(bounties) > filters.Limit {
-		nextCursor = bounties[filters.Limit-1].CreatedAt.Format(time.RFC3339Nano)
-		bounties = bounties[:filters.Limit]
+	if len(bounties) > limit {
+		last := bounties[limit-1]
+		nextCursor = encodeBountyCursor(last.CreatedAt, last.ID)
+		bounties = bounties[:limit]
 	}
 
 	return bounties, nextCursor, nil
+}
+
+func buildListBountiesQuery(filters ListFilters) (string, []interface{}, int, error) {
+	query := `
+		SELECT b.id, b.project_id, b.github_issue_number, b.title, b.description, b.difficulty, b.reward_sats, b.fee_sats, b.state, b.expires_at, b.created_at, p.repo_full_name
+		FROM bounties b
+		JOIN projects p ON b.project_id = p.id
+		WHERE b.state = 'open' AND b.expires_at > now()
+	`
+	args := []interface{}{}
+	placeholder := func() string { return "$" + strconv.Itoa(len(args)+1) }
+
+	if filters.Query != "" {
+		query += ` AND (b.title ILIKE ` + placeholder() + ` OR b.description ILIKE ` + placeholder() + `)`
+		args = append(args, "%"+filters.Query+"%")
+	}
+	if filters.Language != "" {
+		query += ` AND p.repo_full_name ILIKE ` + placeholder()
+		args = append(args, "%"+filters.Language+"%")
+	}
+	if filters.Difficulty != "" {
+		query += ` AND b.difficulty = ` + placeholder()
+		args = append(args, filters.Difficulty)
+	}
+	if filters.MinReward > 0 {
+		query += ` AND b.reward_sats >= ` + placeholder()
+		args = append(args, filters.MinReward)
+	}
+	if filters.MaxReward > 0 {
+		query += ` AND b.reward_sats <= ` + placeholder()
+		args = append(args, filters.MaxReward)
+	}
+
+	if filters.Cursor != "" {
+		cursorTime, cursorID, err := parseBountyCursor(filters.Cursor)
+		if err != nil {
+			return "", nil, 0, err
+		}
+		timePlaceholder := placeholder()
+		args = append(args, cursorTime)
+		idPlaceholder := placeholder()
+		args = append(args, cursorID)
+		query += ` AND (b.created_at, b.id) < (` + timePlaceholder + `::timestamptz, ` + idPlaceholder + `::bigint)`
+	}
+
+	limit := filters.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	query += ` ORDER BY b.created_at DESC, b.id DESC LIMIT ` + placeholder()
+	args = append(args, limit+1)
+	return query, args, limit, nil
+}
+
+func parseBountyCursor(cursor string) (time.Time, int64, error) {
+	timestamp, rawID, ok := strings.Cut(cursor, "|")
+	if !ok || timestamp == "" || rawID == "" {
+		return time.Time{}, 0, ErrInvalidCursor
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return time.Time{}, 0, ErrInvalidCursor
+	}
+	id, err := strconv.ParseInt(rawID, 10, 64)
+	if err != nil || id <= 0 {
+		return time.Time{}, 0, ErrInvalidCursor
+	}
+	return createdAt, id, nil
+}
+
+func encodeBountyCursor(createdAt time.Time, id int64) string {
+	return createdAt.UTC().Format(time.RFC3339Nano) + "|" + strconv.FormatInt(id, 10)
 }
 
 type ListFilters struct {
@@ -306,6 +361,9 @@ type Claim struct {
 }
 
 func (s *Service) ClaimBounty(ctx context.Context, bountyID, userID int64) (*Claim, error) {
+	if s.queue == nil {
+		return nil, errors.New("claim expiry queue is not configured")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -365,15 +423,75 @@ func (s *Service) ClaimBounty(ctx context.Context, bountyID, userID int64) (*Cla
 		return nil, err
 	}
 
+	if err := s.queue.InsertTx(ctx, tx, &queue.ClaimExpiryArgs{ClaimID: claim.ID}, river.InsertOpts{ScheduledAt: expiresAt}); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 
-	if s.queue != nil {
-		s.queue.Insert(ctx, &queue.ClaimExpiryArgs{ClaimID: claim.ID}, river.InsertOpts{ScheduledAt: expiresAt})
-	}
-
 	return &claim, nil
+}
+
+// ExpireClaim releases an elapsed active claim. If its bounty has also expired,
+// the reserved reward is refunded instead of reopening the bounty.
+func (s *Service) ExpireClaim(ctx context.Context, claimID int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var bountyID int64
+	err = tx.QueryRow(ctx, `SELECT bounty_id FROM claims WHERE id = $1`, claimID).Scan(&bountyID)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var bounty Bounty
+	err = tx.QueryRow(ctx, `SELECT id, project_id, reward_sats, state, expires_at FROM bounties WHERE id = $1 FOR UPDATE`, bountyID).Scan(
+		&bounty.ID, &bounty.ProjectID, &bounty.RewardSats, &bounty.State, &bounty.ExpiresAt,
+	)
+	if err != nil {
+		return err
+	}
+	var claim Claim
+	err = tx.QueryRow(ctx, `SELECT id, status, expires_at FROM claims WHERE id = $1 FOR UPDATE`, claimID).Scan(&claim.ID, &claim.Status, &claim.ExpiresAt)
+	if err != nil {
+		return err
+	}
+	if claim.Status != "active" || claim.ExpiresAt.After(time.Now()) || bounty.State != "claimed" {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE claims SET status = 'expired' WHERE id = $1`, claimID); err != nil {
+		return err
+	}
+	if !bounty.ExpiresAt.After(time.Now()) {
+		if s.ledger == nil {
+			return errors.New("ledger service is not configured")
+		}
+		result, err := tx.Exec(ctx, `UPDATE wallets SET available_sats = available_sats + $1, reserved_sats = reserved_sats - $1, updated_at = now() WHERE project_id = $2 AND reserved_sats >= $1`, bounty.RewardSats, bounty.ProjectID)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() != 1 {
+			return errors.New("project wallet is missing or has insufficient reserved funds for claim expiry")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE bounties SET state = 'expired', updated_at = now() WHERE id = $1`, bountyID); err != nil {
+			return err
+		}
+		if err := s.ledger.RefundBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(ctx, `UPDATE bounties SET state = 'open', updated_at = now() WHERE id = $1`, bountyID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_log (actor, action, subject) VALUES ('system', 'claim.expired', $1)`, "claim:"+strconv.FormatInt(claimID, 10)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Service) ReleaseClaim(ctx context.Context, bountyID, userID int64) error {
@@ -383,18 +501,48 @@ func (s *Service) ReleaseClaim(ctx context.Context, bountyID, userID int64) erro
 	}
 	defer tx.Rollback(ctx)
 
-	result, err := tx.Exec(ctx, `
-		UPDATE claims SET status = 'released' WHERE bounty_id = $1 AND user_id = $2 AND status = 'active'
-	`, bountyID, userID)
+	var bounty Bounty
+	err = tx.QueryRow(ctx, `SELECT id, project_id, reward_sats, state, expires_at FROM bounties WHERE id = $1 FOR UPDATE`, bountyID).Scan(
+		&bounty.ID, &bounty.ProjectID, &bounty.RewardSats, &bounty.State, &bounty.ExpiresAt,
+	)
+	if err == sql.ErrNoRows {
+		return ErrBountyNotFound
+	}
 	if err != nil {
 		return err
 	}
-	if result.RowsAffected() == 0 {
+	var claimID int64
+	err = tx.QueryRow(ctx, `UPDATE claims SET status = 'released' WHERE bounty_id = $1 AND user_id = $2 AND status = 'active' RETURNING id`, bountyID, userID).Scan(&claimID)
+	if err == sql.ErrNoRows {
 		return errors.New("no active claim found")
 	}
-
-	_, err = tx.Exec(ctx, `UPDATE bounties SET state = 'open', updated_at = now() WHERE id = $1`, bountyID)
 	if err != nil {
+		return err
+	}
+	if bounty.State != "claimed" {
+		return ErrInvalidState
+	}
+	if !bounty.ExpiresAt.After(time.Now()) {
+		if s.ledger == nil {
+			return errors.New("ledger service is not configured")
+		}
+		result, err := tx.Exec(ctx, `UPDATE wallets SET available_sats = available_sats + $1, reserved_sats = reserved_sats - $1, updated_at = now() WHERE project_id = $2 AND reserved_sats >= $1`, bounty.RewardSats, bounty.ProjectID)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() != 1 {
+			return errors.New("project wallet is missing or has insufficient reserved funds for claim release")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE bounties SET state = 'expired', updated_at = now() WHERE id = $1`, bountyID); err != nil {
+			return err
+		}
+		if err := s.ledger.RefundBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(ctx, `UPDATE bounties SET state = 'open', updated_at = now() WHERE id = $1`, bountyID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_log (actor, action, subject) VALUES ($1, 'claim.released', $2)`, "user:"+strconv.FormatInt(userID, 10), "claim:"+strconv.FormatInt(claimID, 10)); err != nil {
 		return err
 	}
 
@@ -402,6 +550,9 @@ func (s *Service) ReleaseClaim(ctx context.Context, bountyID, userID int64) erro
 }
 
 func (s *Service) CancelBounty(ctx context.Context, bountyID, projectID int64) (*Bounty, error) {
+	if s.ledger == nil {
+		return nil, errors.New("ledger service is not configured")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -437,10 +588,8 @@ func (s *Service) CancelBounty(ctx context.Context, bountyID, projectID int64) (
 		return nil, err
 	}
 
-	if s.ledger != nil {
-		if err := s.ledger.RefundBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats); err != nil {
-			return nil, err
-		}
+	if err := s.ledger.RefundBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats); err != nil {
+		return nil, err
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO audit_log (actor, action, subject, metadata)
@@ -455,6 +604,63 @@ func (s *Service) CancelBounty(ctx context.Context, bountyID, projectID int64) (
 
 	bounty.State = "cancelled"
 	return &bounty, nil
+}
+
+// ExpireBounty refunds an open bounty after its expiry. It is safe for a
+// scheduled job to run more than once or after a maintainer already cancelled.
+func (s *Service) ExpireBounty(ctx context.Context, bountyID int64) error {
+	if s.ledger == nil {
+		return errors.New("ledger service is not configured")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var bounty Bounty
+	err = tx.QueryRow(ctx, `
+		SELECT id, project_id, reward_sats, state, expires_at
+		FROM bounties WHERE id = $1 FOR UPDATE
+	`, bountyID).Scan(&bounty.ID, &bounty.ProjectID, &bounty.RewardSats, &bounty.State, &bounty.ExpiresAt)
+	if err == sql.ErrNoRows {
+		return ErrBountyNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if !canExpireBounty(bounty.State, bounty.ExpiresAt, time.Now()) {
+		return nil
+	}
+
+	walletUpdate, err := tx.Exec(ctx, `
+		UPDATE wallets SET available_sats = available_sats + $1,
+			reserved_sats = reserved_sats - $1, updated_at = now()
+		WHERE project_id = $2 AND reserved_sats >= $1
+	`, bounty.RewardSats, bounty.ProjectID)
+	if err != nil {
+		return err
+	}
+	if walletUpdate.RowsAffected() != 1 {
+		return errors.New("project wallet is missing or has insufficient reserved funds for bounty expiry")
+	}
+	if _, err := tx.Exec(ctx, `UPDATE bounties SET state = 'expired', updated_at = now() WHERE id = $1`, bounty.ID); err != nil {
+		return err
+	}
+	if err := s.ledger.RefundBountyFunds(ctx, tx, bounty.ProjectID, bounty.ID, bounty.RewardSats); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_log (actor, action, subject, metadata)
+		VALUES ('system', 'bounty.expired', $1, jsonb_build_object('refund_sats', $2))
+	`, "bounty:"+strconv.FormatInt(bounty.ID, 10), bounty.RewardSats); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func canExpireBounty(state string, expiresAt, now time.Time) bool {
+	return state == "open" && !expiresAt.After(now)
 }
 
 func canCancelBounty(state string) bool {
@@ -563,6 +769,53 @@ func (s *Service) CreateDeposit(ctx context.Context, projectID int64, idempotenc
 		return nil, err
 	}
 	return &deposit, nil
+}
+
+// GetOrCreateDeposit serializes invoice creation for a project idempotency key.
+// The callback runs while holding a PostgreSQL transaction-scoped advisory lock.
+func (s *Service) GetOrCreateDeposit(ctx context.Context, projectID int64, idempotencyKey string, amountSats int64, createInvoice func(context.Context) (string, []byte, time.Time, error)) (*Deposit, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, strconv.FormatInt(projectID, 10)+":"+idempotencyKey); err != nil {
+		return nil, false, err
+	}
+	deposit, err := scanDeposit(tx.QueryRow(ctx, `
+		SELECT id, project_id, bolt11, payment_hash, amount_sats, status, expires_at, settled_at, created_at
+		FROM deposits WHERE project_id = $1 AND idempotency_key = $2
+	`, projectID, idempotencyKey))
+	if err == nil {
+		if deposit.AmountSats != amountSats {
+			return nil, false, ErrIdempotencyConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, err
+		}
+		return &deposit, false, nil
+	}
+	if err != sql.ErrNoRows {
+		return nil, false, err
+	}
+	bolt11, paymentHash, expiresAt, err := createInvoice(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO deposits (project_id, bolt11, payment_hash, amount_sats, status, idempotency_key, expires_at)
+		VALUES ($1, $2, $3, $4, 'pending', $5, $6)
+		RETURNING id, project_id, bolt11, payment_hash, amount_sats, status, expires_at, settled_at, created_at
+	`, projectID, bolt11, paymentHash, amountSats, idempotencyKey, expiresAt).Scan(
+		&deposit.ID, &deposit.ProjectID, &deposit.Bolt11, &deposit.PaymentHash, &deposit.AmountSats, &deposit.Status, &deposit.ExpiresAt, &deposit.SettledAt, &deposit.CreatedAt,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	return &deposit, true, nil
 }
 
 func scanDeposit(row interface{ Scan(...any) error }) (Deposit, error) {
