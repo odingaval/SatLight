@@ -3,10 +3,12 @@ package ledger
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -140,7 +142,23 @@ func (s *Service) GetAccountBalance(ctx context.Context, account string) (int64,
 	return balance, err
 }
 
-func (s *Service) Reconcile(ctx context.Context) (map[string]int64, error) {
+type WalletMismatch struct {
+	ProjectID       int64 `json:"project_id"`
+	AvailableCached int64 `json:"available_cached_sats"`
+	AvailableLedger int64 `json:"available_ledger_sats"`
+	ReservedCached  int64 `json:"reserved_cached_sats"`
+	ReservedLedger  int64 `json:"reserved_ledger_sats"`
+}
+
+type ReconciliationReport struct {
+	CheckedAt        time.Time        `json:"checked_at"`
+	AccountBalances  map[string]int64 `json:"account_balances"`
+	WalletMismatches []WalletMismatch `json:"wallet_mismatches"`
+	UnbalancedTxIDs  []string         `json:"unbalanced_transaction_ids"`
+	Healthy          bool             `json:"healthy"`
+}
+
+func (s *Service) Reconcile(ctx context.Context) (*ReconciliationReport, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT account, SUM(CASE WHEN direction = 'credit' THEN amount_sats ELSE -amount_sats END) as balance
 		FROM ledger_entries
@@ -149,16 +167,105 @@ func (s *Service) Reconcile(ctx context.Context) (map[string]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	balances := make(map[string]int64)
+	report := &ReconciliationReport{
+		CheckedAt:        time.Now().UTC(),
+		AccountBalances:  make(map[string]int64),
+		WalletMismatches: []WalletMismatch{},
+		UnbalancedTxIDs:  []string{},
+		Healthy:          true,
+	}
 	for rows.Next() {
 		var account string
 		var balance int64
 		if err := rows.Scan(&account, &balance); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		balances[account] = balance
+		report.AccountBalances[account] = balance
 	}
-	return balances, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	walletRows, err := s.pool.Query(ctx, `
+		WITH ledger_balances AS (
+			SELECT account, SUM(CASE WHEN direction = 'credit' THEN amount_sats ELSE -amount_sats END) AS balance
+			FROM ledger_entries GROUP BY account
+		)
+		SELECT w.project_id, w.available_sats, COALESCE(a.balance, 0),
+		       w.reserved_sats, COALESCE(r.balance, 0)
+		FROM wallets w
+		LEFT JOIN ledger_balances a ON a.account = 'project:' || w.project_id::text || ':available'
+		LEFT JOIN ledger_balances r ON r.account = 'project:' || w.project_id::text || ':reserved'
+		WHERE w.available_sats <> COALESCE(a.balance, 0)
+		   OR w.reserved_sats <> COALESCE(r.balance, 0)
+		ORDER BY w.project_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	for walletRows.Next() {
+		var mismatch WalletMismatch
+		if err := walletRows.Scan(&mismatch.ProjectID, &mismatch.AvailableCached, &mismatch.AvailableLedger, &mismatch.ReservedCached, &mismatch.ReservedLedger); err != nil {
+			walletRows.Close()
+			return nil, err
+		}
+		report.WalletMismatches = append(report.WalletMismatches, mismatch)
+	}
+	if err := walletRows.Err(); err != nil {
+		walletRows.Close()
+		return nil, err
+	}
+	walletRows.Close()
+
+	txRows, err := s.pool.Query(ctx, `
+		SELECT tx_id::text
+		FROM ledger_entries
+		GROUP BY tx_id
+		HAVING SUM(CASE WHEN direction = 'credit' THEN amount_sats ELSE -amount_sats END) <> 0
+		ORDER BY tx_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	for txRows.Next() {
+		var txID string
+		if err := txRows.Scan(&txID); err != nil {
+			txRows.Close()
+			return nil, err
+		}
+		report.UnbalancedTxIDs = append(report.UnbalancedTxIDs, txID)
+	}
+	if err := txRows.Err(); err != nil {
+		txRows.Close()
+		return nil, err
+	}
+	txRows.Close()
+
+	report.Healthy = len(report.WalletMismatches) == 0 && len(report.UnbalancedTxIDs) == 0
+	return report, nil
+}
+
+func (s *Service) RunReconciliation(ctx context.Context) error {
+	report, err := s.Reconcile(ctx)
+	if err != nil {
+		return err
+	}
+	metadata, err := json.Marshal(report)
+	if err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO audit_log (actor, action, subject, metadata)
+		VALUES ('system', 'ledger.reconciliation', 'platform', $1::jsonb)
+	`, string(metadata)); err != nil {
+		return err
+	}
+	if !report.Healthy {
+		return fmt.Errorf("ledger reconciliation found %d wallet mismatches and %d unbalanced transactions", len(report.WalletMismatches), len(report.UnbalancedTxIDs))
+	}
+	return nil
 }

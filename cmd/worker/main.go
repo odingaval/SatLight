@@ -11,8 +11,10 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/satlight/satlight/internal/bounty"
 	"github.com/satlight/satlight/internal/config"
 	"github.com/satlight/satlight/internal/db"
+	"github.com/satlight/satlight/internal/ledger"
 	"github.com/satlight/satlight/internal/queue"
 )
 
@@ -37,14 +39,28 @@ func main() {
 	}
 	defer pool.Close()
 
+	ledgerService := ledger.NewService(cfg, pool)
+	bountyService := bounty.NewService(cfg, pool)
+	bountyService.SetDependencies(ledgerService, nil)
+
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &queue.ProcessPayoutJob{})
 	river.AddWorker(workers, &queue.ProcessWebhookJob{})
-	river.AddWorker(workers, &queue.ReconciliationJob{})
-	river.AddWorker(workers, &queue.ClaimExpiryJob{})
+	river.AddWorker(workers, &queue.ReconciliationJob{Service: ledgerService})
+	river.AddWorker(workers, &queue.ClaimExpiryJob{Service: bountyService})
+	river.AddWorker(workers, &queue.BountyExpiryJob{Service: bountyService})
 
 	driver := riverpgxv5.New(pool)
 	client, err := river.NewClient(driver, &river.Config{
+		PeriodicJobs: []*river.PeriodicJob{
+			river.NewPeriodicJob(
+				river.PeriodicInterval(time.Hour),
+				func() (river.JobArgs, *river.InsertOpts) {
+					return queue.ReconciliationArgs{}, &river.InsertOpts{Queue: "reconciliation"}
+				},
+				&river.PeriodicJobOpts{RunOnStart: true},
+			),
+		},
 		Queues: map[string]river.QueueConfig{
 			river.QueueDefault: {MaxWorkers: 10},
 			"payouts":          {MaxWorkers: 5},

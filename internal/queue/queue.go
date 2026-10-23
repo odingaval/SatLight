@@ -38,6 +38,15 @@ func (c *Client) Insert(ctx context.Context, args river.JobArgs, opts ...river.I
 	return err
 }
 
+func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args river.JobArgs, opts ...river.InsertOpts) error {
+	var insertOpts *river.InsertOpts
+	if len(opts) > 0 {
+		insertOpts = &opts[0]
+	}
+	_, err := c.Client.InsertTx(ctx, tx, args, insertOpts)
+	return err
+}
+
 type ProcessPayoutArgs struct {
 	PayoutID int64 `json:"payout_id"`
 }
@@ -72,10 +81,15 @@ func (ReconciliationArgs) Kind() string { return "reconciliation" }
 
 type ReconciliationJob struct {
 	river.WorkerDefaults[ReconciliationArgs]
+	Service ReconciliationRunner
+}
+
+type ReconciliationRunner interface {
+	RunReconciliation(ctx context.Context) error
 }
 
 func (j *ReconciliationJob) Work(ctx context.Context, job *river.Job[ReconciliationArgs]) error {
-	return nil
+	return j.Service.RunReconciliation(ctx)
 }
 
 type ClaimExpiryArgs struct {
@@ -86,8 +100,32 @@ func (ClaimExpiryArgs) Kind() string { return "claim_expiry" }
 
 type ClaimExpiryJob struct {
 	river.WorkerDefaults[ClaimExpiryArgs]
+	Service ClaimExpirer
+}
+
+type ClaimExpirer interface {
+	ExpireClaim(ctx context.Context, claimID int64) error
 }
 
 func (j *ClaimExpiryJob) Work(ctx context.Context, job *river.Job[ClaimExpiryArgs]) error {
-	return nil
+	return j.Service.ExpireClaim(ctx, job.Args.ClaimID)
+}
+
+type BountyExpiryArgs struct {
+	BountyID int64 `json:"bounty_id"`
+}
+
+func (BountyExpiryArgs) Kind() string { return "bounty_expiry" }
+
+type BountyExpirer interface {
+	ExpireBounty(ctx context.Context, bountyID int64) error
+}
+
+type BountyExpiryJob struct {
+	river.WorkerDefaults[BountyExpiryArgs]
+	Service BountyExpirer
+}
+
+func (j *BountyExpiryJob) Work(ctx context.Context, job *river.Job[BountyExpiryArgs]) error {
+	return j.Service.ExpireBounty(ctx, job.Args.BountyID)
 }
