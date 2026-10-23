@@ -14,7 +14,7 @@ if (!handledPage) {
 app.innerHTML = `
   <header class="site-header">
     <div class="container nav">
-      <a class="nav-brand" href="#top" aria-label="Satlight home"><span class="brand-mark">₿</span> satlight</a>
+      <a class="nav-brand" href="#top" aria-label="Satlight home"><span class="brand-mark" aria-hidden="true"></span> satlight</a>
       <nav class="nav-links" aria-label="Main navigation">
         <a class="nav-link" href="/bounties">Browse bounties</a>
         <a class="nav-link" href="#how-it-works">How it works</a>
@@ -81,7 +81,7 @@ app.innerHTML = `
     <section class="register-section" id="register"><div class="container register-inner"><div><p class="eyebrow">PROJECT REGISTRATION</p><h2>Bring your repository<br>to <span>Satlight.</span></h2><p>Sign in with GitHub, install the Satlight GitHub App on your repository, then register it here.</p></div><div class="register-card" id="register-card"><p class="register-loading">Checking your GitHub session…</p></div></div></section>
   </main>
 
-  <footer class="site-footer"><div class="container footer-inner"><a class="nav-brand" href="#top"><span class="brand-mark">₿</span> satlight</a><span>Rewarding the work that moves open source forward.</span><a href="#top">Back to top ↑</a></div><div class="container footer-bottom"><span>© 2026 Satlight. Early development.</span><span>Bitcoin payments involve risk. Use test funds during early access.</span></div></footer>
+  <footer class="site-footer"><div class="container footer-inner"><a class="nav-brand" href="#top"><span class="brand-mark" aria-hidden="true"></span> satlight</a><span>Rewarding the work that moves open source forward.</span><a href="#top">Back to top ↑</a></div><div class="container footer-bottom"><span>© 2026 Satlight. Early development.</span><span>Bitcoin payments involve risk. Use test funds during early access.</span></div></footer>
 `
 
 const waitlistForm = document.querySelector<HTMLFormElement>('#waitlist-form')!
