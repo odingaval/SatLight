@@ -12,5 +12,8 @@
 | 008 | Hosting | Open |
 | 009 | License | Proposed |
 | 010 | Fee mechanics | Proposed |
+| 011 | [Deposit expiry and late payments](../011-late-deposits.md) | Proposed |
+| 012 | [Project withdrawal policy](../012-withdrawal-policy.md) | Proposed; counsel review required |
+| 013 | [Reconciliation mismatch response](../013-reconciliation-response.md) | Proposed |
 
 Template: copy any file here. Sections: Status, Date, Context, Decision, Consequences. Never edit an accepted ADR's decision; supersede it with a new one.

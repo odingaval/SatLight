@@ -16,7 +16,7 @@ type LightningClient interface {
 1. Maintainer requests amount; API creates an invoice (1 hour expiry) and stores `deposits` row.
 2. Invoice subscription (plus a periodic poll as backup) marks the deposit `settled`.
 3. In one DB transaction: set deposit settled, write ledger entries (`node:liquidity` debit, `project:{id}:available` credit), update wallet.
-4. Underpayment is impossible for BOLT11 amounts; overpayment is credited; expired invoices are ignored.
+4. Overpayment is credited. Underpayment is normally prevented by fixed-amount BOLT11 invoices, but settlement handling must use the actual amount received. Per proposed [ADR-011](../011-late-deposits.md), the node determines expiry, known late settlements are credited at the actual received amount, and unknown receipts are quarantined for review. This policy is proposed and not implemented yet.
 
 ## Payouts (sequence)
 ```

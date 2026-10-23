@@ -86,9 +86,9 @@ All amounts are integer satoshis. The wallet is a fast balance cache; the ledger
 
 ## Known gaps to close
 
-- Simultaneous requests using the same deposit idempotency key are now serialized with a transaction-scoped PostgreSQL advisory lock. A process/database failure after LND creates an invoice but before its deposit row commits can still leave an untracked invoice; safe recovery needs invoice metadata/reconciliation or an explicit pending-request protocol. There is no expiry worker for deposits, so expired status and late settlement handling need to be completed.
-- Reconciliation still needs an agreed definition of platform liabilities, a comparison with LND node balance, and an operational alert or money-movement pause on mismatch.
-- Project withdrawal is explicitly unavailable: the authenticated endpoint returns HTTP 501 and does not imply that funds were queued. Product and Terms still need to align on whether and when project owners may withdraw available funds.
+- The proposed late-deposit policy is in [ADR-011](../011-late-deposits.md): node-reported expiry, credit known late settlements at the amount received, and quarantine unknown receipts for staff review. It is not implemented yet. Work includes storing node expiry/cancellation, actual received amount and late-settlement marker, unmatched receipts and review, alerting, and crash recovery for an invoice created before its deposit row commits.
+- The proposed withdrawal policy is in [ADR-012](../012-withdrawal-policy.md), and depends on counsel accepting the custody model. It recommends controlled withdrawals of available funds, including a 24-hour deposit hold, limits, destination checks, and a persisted payment attempt. The endpoint currently returns HTTP 501. If counsel approves the policy, implement the withdrawal records, ledger account, server-side checks, payment flow, and kill-switch behavior; otherwise resolve and implement the fallback policy. Terms currently promise withdrawal at any time and must be reconciled with the approved policy.
+- The proposed mismatch response is in [ADR-013](../013-reconciliation-response.md). Reconciliation currently compares wallet caches with ledger balances and checks transaction balance, but does not compare node funds with liabilities, account for in-flight payments, persist reconciliation runs, or enforce a pause. Implement the proposed node-balance calculation, tolerance, `reconciliation_runs` and `system_flags`, fail-closed actions, and alerting. Fill in actual on-call contacts and exercise the two-person resume procedure before beta.
 - The bounty cursor query has unit coverage for SQL clause order and parameter values. Database-backed coverage for filter/cursor combinations is still needed.
 - State transitions are not yet routed through the single transition function described by the spec; transitions other than cancellation and expiry are not yet audited.
 - The implemented fee math has unit coverage, but fee and routing-cost policy still needs agreement across product docs, UI, and Terms.
@@ -106,6 +106,9 @@ M2 does not send contributor payouts or decide whether a pull request qualifies.
 - [Ledger and accounting](../specs/ledger-and-accounting.md)
 - [Lightning integration](../specs/lightning-integration.md)
 - [Testing strategy](../specs/testing-strategy.md)
+- [ADR-011: Deposit expiry and late payments](../011-late-deposits.md)
+- [ADR-012: Project withdrawal policy](../012-withdrawal-policy.md)
+- [ADR-013: Reconciliation mismatch response](../013-reconciliation-response.md)
 - [Terms of Service draft](../legal/terms-of-service.md)
 - [Privacy Policy draft](../legal/privacy-policy.md)
 - [Regulatory memo template](../legal/regulatory-memo.md)
