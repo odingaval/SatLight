@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -24,8 +25,13 @@ var (
 )
 
 type Service struct {
-	pool *pgxpool.Pool
-	log  zerolog.Logger
+	pool        *pgxpool.Pool
+	log         zerolog.Logger
+	nodeBalance NodeBalanceProvider
+}
+
+type NodeBalanceProvider interface {
+	GetTotalBalance(context.Context) (int64, error)
 }
 
 func NewService(cfg interface{}, pool *pgxpool.Pool) *Service {
@@ -34,6 +40,10 @@ func NewService(cfg interface{}, pool *pgxpool.Pool) *Service {
 		pool: pool,
 		log:  logger,
 	}
+}
+
+func (s *Service) SetNodeBalanceProvider(provider NodeBalanceProvider) {
+	s.nodeBalance = provider
 }
 
 type Entry struct {
@@ -155,6 +165,13 @@ type ReconciliationReport struct {
 	AccountBalances  map[string]int64 `json:"account_balances"`
 	WalletMismatches []WalletMismatch `json:"wallet_mismatches"`
 	UnbalancedTxIDs  []string         `json:"unbalanced_transaction_ids"`
+	NodeBalanceSats  int64            `json:"node_balance_sats"`
+	LiabilitiesSats  int64            `json:"liabilities_sats"`
+	EquitySats       int64            `json:"equity_sats"`
+	InFlightSats     int64            `json:"in_flight_sats"`
+	DriftSats        int64            `json:"drift_sats"`
+	Severity         string           `json:"severity"`
+	NodeBalanceError string           `json:"node_balance_error,omitempty"`
 	Healthy          bool             `json:"healthy"`
 }
 
@@ -245,7 +262,42 @@ func (s *Service) Reconcile(ctx context.Context) (*ReconciliationReport, error) 
 	}
 	txRows.Close()
 
-	report.Healthy = len(report.WalletMismatches) == 0 && len(report.UnbalancedTxIDs) == 0
+	for account, balance := range report.AccountBalances {
+		if strings.HasPrefix(account, "project:") || strings.HasPrefix(account, "user:") {
+			// User external accounts represent already-paid amounts, not funds
+			// still owed by the platform. Only project wallet buckets are liabilities.
+			if strings.HasPrefix(account, "project:") && balance > 0 {
+				report.LiabilitiesSats += balance
+			}
+		}
+	}
+	report.EquitySats = report.AccountBalances["platform:fees"] - report.AccountBalances["platform:routing_costs"]
+	if s.nodeBalance == nil {
+		report.Severity = "error"
+		report.NodeBalanceError = "node balance provider is not configured"
+	} else if balance, err := s.nodeBalance.GetTotalBalance(ctx); err != nil {
+		report.Severity = "error"
+		report.NodeBalanceError = err.Error()
+	} else {
+		report.NodeBalanceSats = balance
+	}
+	if report.Severity != "error" {
+		if err := s.pool.QueryRow(ctx, `SELECT COALESCE(SUM(amount_sats), 0) FROM payouts WHERE status = 'sending'`).Scan(&report.InFlightSats); err != nil {
+			return nil, err
+		}
+		report.DriftSats = report.NodeBalanceSats - (report.LiabilitiesSats + report.EquitySats)
+		switch {
+		case report.DriftSats < -100 && -report.DriftSats <= report.InFlightSats+100:
+			report.Severity = "info"
+		case report.DriftSats < -100:
+			report.Severity = "critical"
+		case report.DriftSats > 100:
+			report.Severity = "warning"
+		default:
+			report.Severity = "ok"
+		}
+	}
+	report.Healthy = len(report.WalletMismatches) == 0 && len(report.UnbalancedTxIDs) == 0 && (report.Severity == "ok" || report.Severity == "info")
 	return report, nil
 }
 
@@ -258,6 +310,28 @@ func (s *Service) RunReconciliation(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var nodeBalance any
+	if report.NodeBalanceError == "" {
+		nodeBalance = report.NodeBalanceSats
+	}
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO reconciliation_runs (checked_at, node_balance_sats, liabilities_sats, equity_sats, in_flight_sats, drift_sats, severity, report)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+	`, report.CheckedAt, nodeBalance, report.LiabilitiesSats, report.EquitySats, report.InFlightSats, report.DriftSats, report.Severity, string(metadata)); err != nil {
+		return err
+	}
+	if report.Severity == "critical" || report.Severity == "error" || len(report.WalletMismatches) > 0 || len(report.UnbalancedTxIDs) > 0 {
+		reason, _ := json.Marshal(map[string]any{"severity": report.Severity, "drift_sats": report.DriftSats})
+		if _, err := s.pool.Exec(ctx, `
+			UPDATE system_flags SET enabled = TRUE, reason = $1, changed_at = now(), changed_by = 'reconciliation'
+			WHERE name IN ('funding_paused','outflows_paused')
+		`, string(reason)); err != nil {
+			return err
+		}
+	}
+	if report.Severity == "warning" {
+		s.log.Warn().Int64("drift_sats", report.DriftSats).Msg("reconciliation found node funds not explained by ledger")
+	}
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO audit_log (actor, action, subject, metadata)
 		VALUES ('system', 'ledger.reconciliation', 'platform', $1::jsonb)
@@ -265,7 +339,7 @@ func (s *Service) RunReconciliation(ctx context.Context) error {
 		return err
 	}
 	if !report.Healthy {
-		return fmt.Errorf("ledger reconciliation found %d wallet mismatches and %d unbalanced transactions", len(report.WalletMismatches), len(report.UnbalancedTxIDs))
+		return fmt.Errorf("reconciliation severity=%s drift=%d sats, %d wallet mismatches, %d unbalanced transactions", report.Severity, report.DriftSats, len(report.WalletMismatches), len(report.UnbalancedTxIDs))
 	}
 	return nil
 }

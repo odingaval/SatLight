@@ -1,6 +1,6 @@
 # ADR-013: Reconciliation mismatch response
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-23
 
 ## Context
@@ -44,3 +44,8 @@ Rules:
 - A real shortfall stops money leaving within one reconciliation run.
 - Adds `reconciliation_runs`, `system_flags`, and `internal/reconcile` with tests.
 - Names and contact methods for on-call must be filled in before beta.
+
+## Implementation status
+- The worker compares confirmed on-chain wallet funds plus local channel balance against project wallet liabilities and net platform fees, with a 100-sat tolerance and a `sending` payout allowance.
+- Every reconciliation report is persisted in `reconciliation_runs`. Critical shortfalls, node-balance errors, wallet cache mismatches, and unbalanced ledger transactions set persistent funding and outflow pause flags. New deposit invoices and bounty funding check the funding pause flag.
+- Warning and critical findings are logged. Paging, node reconnect-triggered runs, clean-run two-person resume tooling, and enforcement in a future payout sender remain operational work. Withdrawals and payout sending are not currently implemented.

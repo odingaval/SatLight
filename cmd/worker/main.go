@@ -15,6 +15,7 @@ import (
 	"github.com/satlight/satlight/internal/config"
 	"github.com/satlight/satlight/internal/db"
 	"github.com/satlight/satlight/internal/ledger"
+	"github.com/satlight/satlight/internal/lightning"
 	"github.com/satlight/satlight/internal/queue"
 )
 
@@ -40,6 +41,23 @@ func main() {
 	defer pool.Close()
 
 	ledgerService := ledger.NewService(cfg, pool)
+	lightningService := lightning.NewService(&lightning.Config{
+		Host:            cfg.LNDHost,
+		TLSCertPath:     cfg.LNDTLSCert,
+		InvoiceMacaroon: cfg.LNDInvoiceMacaroon,
+		PaymentMacaroon: cfg.LNDPaymentMacaroon,
+		MaxFeePPM:       int64(cfg.PayoutMaxFeePPM),
+		MaxFeeFloorSats: int64(cfg.PayoutMaxFeeFloorSats),
+	}, pool)
+	ledgerService.SetNodeBalanceProvider(lightningService)
+	if cfg.LNDHost != "" {
+		connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := lightningService.Connect(connectCtx); err != nil {
+			log.Warn().Err(err).Msg("could not connect to Lightning node; reconciliation will pause funding and outflows")
+		}
+		cancel()
+		defer lightningService.Close()
+	}
 	bountyService := bounty.NewService(cfg, pool)
 	bountyService.SetDependencies(ledgerService, nil)
 
