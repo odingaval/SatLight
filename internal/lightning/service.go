@@ -130,9 +130,15 @@ func (s *Service) CreateInvoice(ctx context.Context, amountSats int64, memo stri
 	return resp.PaymentRequest, resp.RHash, nil
 }
 
-// SubscribeInvoices streams settled invoice updates to handler. Callers should
-// reconnect this stream when it returns an error.
-func (s *Service) SubscribeInvoices(ctx context.Context, handler func(paymentHash []byte, amountPaidSats int64) error) error {
+type InvoiceUpdate struct {
+	PaymentHash    []byte
+	AmountPaidSats int64
+	State          string
+}
+
+// SubscribeInvoices streams invoice state updates. Callers should reconnect
+// this stream when it returns an error.
+func (s *Service) SubscribeInvoices(ctx context.Context, handler func(InvoiceUpdate) error) error {
 	if s.lightningClient == nil {
 		return ErrNodeUnhealthy
 	}
@@ -145,10 +151,16 @@ func (s *Service) SubscribeInvoices(ctx context.Context, handler func(paymentHas
 		if err != nil {
 			return err
 		}
-		if invoice.State != lnrpc.Invoice_SETTLED {
+		state := ""
+		switch invoice.State {
+		case lnrpc.Invoice_SETTLED:
+			state = "settled"
+		case lnrpc.Invoice_CANCELED:
+			state = "canceled"
+		default:
 			continue
 		}
-		if err := handler(invoice.RHash, invoice.AmtPaidSat); err != nil {
+		if err := handler(InvoiceUpdate{PaymentHash: invoice.RHash, AmountPaidSats: invoice.AmtPaidSat, State: state}); err != nil {
 			return err
 		}
 	}
@@ -224,6 +236,25 @@ func (s *Service) GetChannelBalance(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return int64(resp.LocalBalance.Sat), nil
+}
+
+// GetTotalBalance returns confirmed on-chain wallet funds plus channel-local
+// funds. Unconfirmed wallet funds are excluded from reconciliation assets.
+func (s *Service) GetTotalBalance(ctx context.Context) (int64, error) {
+	if s.lightningClient == nil {
+		return 0, ErrNodeUnhealthy
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	wallet, err := s.lightningClient.WalletBalance(ctx, &lnrpc.WalletBalanceRequest{})
+	if err != nil {
+		return 0, err
+	}
+	channels, err := s.lightningClient.ChannelBalance(ctx, &lnrpc.ChannelBalanceRequest{})
+	if err != nil {
+		return 0, err
+	}
+	return wallet.ConfirmedBalance + int64(channels.LocalBalance.Sat), nil
 }
 
 func (s *Service) GetWalletBalance(ctx context.Context) (int64, error) {

@@ -1,6 +1,6 @@
 # ADR-011: Deposit expiry and late payments
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-23
 
 ## Context
@@ -19,3 +19,9 @@ Deposits are Lightning invoices with a 1 hour expiry. Lightning has no return ad
 - Maintainers are never silently charged for a payment that is not credited.
 - Adds the `unmatched_receipts` table and a small manual review process.
 - Replaces the "expired invoices are ignored" rule in the Lightning integration spec.
+
+## Implementation status
+- Known deposits accept the node-reported settled amount, including underpayments and settlements received after the app expiry time; requested amount remains unchanged and received amount is stored separately.
+- LND cancellation updates mark pending deposits expired. A later settled update can still credit an expired deposit.
+- Settled updates without a matching deposit are persisted in `unmatched_receipts` and audit logged; repeated updates are idempotent by payment hash.
+- Staff review workflow, paging integration, and non-invoice/keysend HTLC observation are still outstanding. The current watcher receives LND invoice subscription updates, not every possible incoming payment event.

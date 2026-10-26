@@ -54,6 +54,7 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		MaxFeePPM:       int64(cfg.PayoutMaxFeePPM),
 		MaxFeeFloorSats: int64(cfg.PayoutMaxFeeFloorSats),
 	}, pool)
+	ledgerSvc.SetNodeBalanceProvider(lightningSvc)
 	appID, err := strconv.ParseInt(cfg.GitHubAppID, 10, 64)
 	if err != nil && cfg.GitHubAppID != "" {
 		logger.Warn().Err(err).Msg("invalid GitHub App ID")
@@ -122,12 +123,22 @@ func (s *Server) WatchLightningInvoices(ctx context.Context) {
 				continue
 			}
 		}
-		err := s.services.Lightning.SubscribeInvoices(ctx, func(paymentHash []byte, amountPaidSats int64) error {
-			err := s.services.Bounty.SettleDeposit(ctx, paymentHash, amountPaidSats)
-			if errors.Is(err, bounty.ErrDepositNotFound) {
+		err := s.services.Lightning.SubscribeInvoices(ctx, func(update lightning.InvoiceUpdate) error {
+			switch update.State {
+			case "settled":
+				err := s.services.Bounty.SettleDeposit(ctx, update.PaymentHash, update.AmountPaidSats)
+				if errors.Is(err, bounty.ErrDepositNotFound) {
+					if err := s.services.Bounty.RecordUnmatchedReceipt(ctx, update.PaymentHash, update.AmountPaidSats); err != nil {
+						return err
+					}
+					return nil
+				}
+				return err
+			case "canceled":
+				return s.services.Bounty.MarkDepositExpired(ctx, update.PaymentHash)
+			default:
 				return nil
 			}
-			return err
 		})
 		if ctx.Err() != nil {
 			return
@@ -610,6 +621,10 @@ func (s *Server) handleCreateDeposit(c *gin.Context) {
 		return bolt11, paymentHash, time.Now().Add(time.Hour), err
 	})
 	if err != nil {
+		if errors.Is(err, bounty.ErrFundingPaused) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "FUNDING_PAUSED", "message": "project funding is temporarily paused"}})
+			return
+		}
 		if errors.Is(err, bounty.ErrIdempotencyConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "IDEMPOTENCY_KEY_REUSED", "message": "Idempotency-Key was already used with a different amount"}})
 			return
@@ -708,6 +723,10 @@ func (s *Server) handleCreateBounty(c *gin.Context) {
 
 	b, err := s.services.Bounty.CreateBounty(c.Request.Context(), params)
 	if err != nil {
+		if errors.Is(err, bounty.ErrFundingPaused) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "FUNDING_PAUSED", "message": "project funding is temporarily paused"}})
+			return
+		}
 		if errors.Is(err, bounty.ErrInsufficientFunds) {
 			c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"code": "INSUFFICIENT_FUNDS", "message": "fund your project wallet before publishing this bounty"}})
 			return

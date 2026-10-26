@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 	"github.com/rs/zerolog"
@@ -29,6 +31,7 @@ var (
 	ErrInvalidCursor        = errors.New("invalid bounty cursor")
 	ErrInvalidExpiry        = errors.New("bounty expiry must be in the future")
 	ErrIdempotencyConflict  = errors.New("idempotency key was reused with different request data")
+	ErrFundingPaused        = errors.New("project funding is temporarily paused")
 )
 
 type Service struct {
@@ -93,6 +96,9 @@ func (s *Service) CreateBounty(ctx context.Context, params CreateBountyParams) (
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := requireFundingEnabled(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	expiresAt := params.ExpiresAt
 	if expiresAt == nil {
@@ -162,6 +168,9 @@ func (s *Service) FundBounty(ctx context.Context, bountyID, projectID int64) (*B
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := requireFundingEnabled(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	var bounty Bounty
 	err = tx.QueryRow(ctx, `
@@ -744,7 +753,7 @@ type Wallet struct {
 
 func (s *Service) GetDepositByIdempotencyKey(ctx context.Context, projectID int64, idempotencyKey string) (*Deposit, error) {
 	deposit, err := scanDeposit(s.pool.QueryRow(ctx, `
-		SELECT id, project_id, bolt11, payment_hash, amount_sats, status, expires_at, settled_at, created_at
+		SELECT id, project_id, bolt11, payment_hash, amount_sats, status, expires_at, settled_at, created_at, received_sats, settled_late
 		FROM deposits WHERE project_id = $1 AND idempotency_key = $2
 	`, projectID, idempotencyKey))
 	if err == sql.ErrNoRows {
@@ -783,7 +792,7 @@ func (s *Service) GetOrCreateDeposit(ctx context.Context, projectID int64, idemp
 		return nil, false, err
 	}
 	deposit, err := scanDeposit(tx.QueryRow(ctx, `
-		SELECT id, project_id, bolt11, payment_hash, amount_sats, status, expires_at, settled_at, created_at
+		SELECT id, project_id, bolt11, payment_hash, amount_sats, status, expires_at, settled_at, created_at, received_sats, settled_late
 		FROM deposits WHERE project_id = $1 AND idempotency_key = $2
 	`, projectID, idempotencyKey))
 	if err == nil {
@@ -796,6 +805,9 @@ func (s *Service) GetOrCreateDeposit(ctx context.Context, projectID int64, idemp
 		return &deposit, false, nil
 	}
 	if err != sql.ErrNoRows {
+		return nil, false, err
+	}
+	if err := requireFundingEnabled(ctx, tx); err != nil {
 		return nil, false, err
 	}
 	bolt11, paymentHash, expiresAt, err := createInvoice(ctx)
@@ -818,9 +830,22 @@ func (s *Service) GetOrCreateDeposit(ctx context.Context, projectID int64, idemp
 	return &deposit, true, nil
 }
 
+func requireFundingEnabled(ctx context.Context, tx interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}) error {
+	var paused bool
+	if err := tx.QueryRow(ctx, `SELECT enabled FROM system_flags WHERE name = 'funding_paused' FOR SHARE`).Scan(&paused); err != nil {
+		return err
+	}
+	if paused {
+		return ErrFundingPaused
+	}
+	return nil
+}
+
 func scanDeposit(row interface{ Scan(...any) error }) (Deposit, error) {
 	var deposit Deposit
-	err := row.Scan(&deposit.ID, &deposit.ProjectID, &deposit.Bolt11, &deposit.PaymentHash, &deposit.AmountSats, &deposit.Status, &deposit.ExpiresAt, &deposit.SettledAt, &deposit.CreatedAt)
+	err := row.Scan(&deposit.ID, &deposit.ProjectID, &deposit.Bolt11, &deposit.PaymentHash, &deposit.AmountSats, &deposit.Status, &deposit.ExpiresAt, &deposit.SettledAt, &deposit.CreatedAt, &deposit.ReceivedSats, &deposit.SettledLate)
 	return deposit, err
 }
 
@@ -840,7 +865,7 @@ func (s *Service) SettleDeposit(ctx context.Context, paymentHash []byte, amountP
 	defer tx.Rollback(ctx)
 
 	var deposit Deposit
-	err = tx.QueryRow(ctx, `SELECT id, project_id, amount_sats, status FROM deposits WHERE payment_hash = $1 FOR UPDATE`, paymentHash).Scan(&deposit.ID, &deposit.ProjectID, &deposit.AmountSats, &deposit.Status)
+	err = tx.QueryRow(ctx, `SELECT id, project_id, amount_sats, status, expires_at FROM deposits WHERE payment_hash = $1 FOR UPDATE`, paymentHash).Scan(&deposit.ID, &deposit.ProjectID, &deposit.AmountSats, &deposit.Status, &deposit.ExpiresAt)
 	if err == sql.ErrNoRows {
 		return ErrDepositNotFound
 	}
@@ -850,13 +875,17 @@ func (s *Service) SettleDeposit(ctx context.Context, paymentHash []byte, amountP
 	if deposit.Status == "settled" {
 		return tx.Commit(ctx)
 	}
-	if deposit.Status != "pending" {
+	if deposit.Status != "pending" && deposit.Status != "expired" {
 		return errors.New("deposit is not pending")
 	}
-	if amountPaidSats < deposit.AmountSats {
-		return ErrDepositUnderpaid
-	}
-	if _, err := tx.Exec(ctx, `UPDATE deposits SET status = 'settled', amount_sats = $2, settled_at = now() WHERE id = $1`, deposit.ID, amountPaidSats); err != nil {
+	late := deposit.Status == "expired" || time.Now().After(deposit.ExpiresAt)
+	if _, err := tx.Exec(ctx, `
+		UPDATE deposits
+		SET status = 'settled', received_sats = $2,
+		    settled_late = (status = 'expired' OR expires_at < now()),
+		    settled_at = now()
+		WHERE id = $1
+	`, deposit.ID, amountPaidSats); err != nil {
 		return err
 	}
 	walletUpdate, err := tx.Exec(ctx, `UPDATE wallets SET available_sats = available_sats + $1, updated_at = now() WHERE project_id = $2`, amountPaidSats, deposit.ProjectID)
@@ -869,17 +898,92 @@ func (s *Service) SettleDeposit(ctx context.Context, paymentHash []byte, amountP
 	if err := s.ledger.CreditDeposit(ctx, tx, deposit.ProjectID, deposit.ID, amountPaidSats); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if late {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_log (actor, action, subject, metadata)
+			VALUES ('system', 'deposit.settled_late', $1, jsonb_build_object('deposit_id', $2::bigint, 'amount_sats', $3::bigint))
+		`, strconv.FormatInt(deposit.ProjectID, 10), deposit.ID, amountPaidSats); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if late {
+		var lateCount int
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM deposits WHERE settled_late AND settled_at >= now() - interval '24 hours'`).Scan(&lateCount); err == nil && lateCount > 5 {
+			s.log.Error().Int("late_deposits_24h", lateCount).Msg("late Lightning deposits exceeded alert threshold")
+		} else {
+			s.log.Warn().Int64("deposit_id", deposit.ID).Msg("late Lightning deposit credited to project wallet")
+		}
+	}
+	return nil
+}
+
+// RecordUnmatchedReceipt quarantines a settled payment with no matching
+// deposit. Replayed invoice updates are idempotent on payment_hash.
+func (s *Service) RecordUnmatchedReceipt(ctx context.Context, paymentHash []byte, amountPaidSats int64) error {
+	if len(paymentHash) == 0 || amountPaidSats <= 0 {
+		return errors.New("invalid unmatched Lightning receipt")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var receiptID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO unmatched_receipts (payment_hash, amount_sats)
+		VALUES ($1, $2)
+		ON CONFLICT (payment_hash) DO NOTHING
+		RETURNING id
+	`, paymentHash, amountPaidSats).Scan(&receiptID)
+	if err == pgx.ErrNoRows {
+		var existingAmount int64
+		if err := tx.QueryRow(ctx, `SELECT amount_sats FROM unmatched_receipts WHERE payment_hash = $1`, paymentHash).Scan(&existingAmount); err != nil {
+			return err
+		}
+		if existingAmount != amountPaidSats {
+			return errors.New("replayed unmatched receipt amount changed")
+		}
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_log (actor, action, subject, metadata)
+		VALUES ('system', 'deposit.unmatched_receipt', $1, jsonb_build_object('receipt_id', $2::bigint, 'amount_sats', $3::bigint, 'payment_hash', encode($4::bytea, 'hex')))
+	`, fmt.Sprintf("receipt:%d", receiptID), receiptID, amountPaidSats, paymentHash); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.log.Error().Int64("receipt_id", receiptID).Int64("amount_sats", amountPaidSats).Msg("unmatched Lightning receipt quarantined; staff review required")
+	return nil
+}
+
+// MarkDepositExpired records expiry only after LND reports cancellation.
+func (s *Service) MarkDepositExpired(ctx context.Context, paymentHash []byte) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE deposits
+		SET status = 'expired', node_expired_at = now(), node_cancelled_at = now()
+		WHERE payment_hash = $1 AND status = 'pending'
+	`, paymentHash)
+	return err
 }
 
 type Deposit struct {
-	ID          int64      `json:"id"`
-	ProjectID   int64      `json:"project_id"`
-	Bolt11      string     `json:"bolt11"`
-	PaymentHash []byte     `json:"payment_hash"`
-	AmountSats  int64      `json:"amount_sats"`
-	Status      string     `json:"status"`
-	ExpiresAt   time.Time  `json:"expires_at"`
-	SettledAt   *time.Time `json:"settled_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
+	ID           int64      `json:"id"`
+	ProjectID    int64      `json:"project_id"`
+	Bolt11       string     `json:"bolt11"`
+	PaymentHash  []byte     `json:"payment_hash"`
+	AmountSats   int64      `json:"amount_sats"`
+	ReceivedSats *int64     `json:"received_sats,omitempty"`
+	Status       string     `json:"status"`
+	SettledLate  bool       `json:"settled_late"`
+	ExpiresAt    time.Time  `json:"expires_at"`
+	SettledAt    *time.Time `json:"settled_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
 }
