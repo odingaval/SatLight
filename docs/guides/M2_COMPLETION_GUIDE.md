@@ -35,15 +35,15 @@ All amounts are integer satoshis. The wallet is a fast balance cache; the ledger
 - [ ] A project owner can request a fixed-amount invoice; another user cannot fund or inspect that project wallet.
 - [ ] Invoice creation and deposit persistence handle retries safely. Reusing a key with different request data is rejected, and concurrent retries cannot create confusing duplicate invoices.
 - [ ] A settled invoice credits the wallet and ledger once, even if LND replays the settlement update or the service reconnects after interruption.
-- [ ] Unknown invoices are ignored; underpayments are not credited; overpayments follow the documented policy; expired invoices cannot credit funds.
+- [ ] Unknown settled invoice receipts are quarantined for review; known settlements credit the actual amount received, including underpayments, overpayments, and settlements LND reports after app expiry.
 - [ ] The app handles LND being unavailable and clearly reports that it cannot create an invoice.
 
 ### 2. Wallet and ledger stay in agreement
 
 - [ ] Deposit, bounty reservation, cancellation, expiry, and any supported withdrawal update wallet and ledger in the same database transaction.
 - [ ] Every ledger transaction balances; entries cannot be edited or deleted; cached available/reserved balances cannot become negative.
-- [ ] Reconciliation detects a mismatch between ledger-derived balances and wallet caches, records the result, and alerts or pauses money movement according to the operations policy.
-- [ ] A withdrawal endpoint either performs and tracks a real, idempotent withdrawal or is clearly unavailable. It must never report “queued” when no withdrawal was persisted or queued.
+- [ ] Reconciliation compares node funds with liabilities and platform equity, accounts for in-flight payouts, persists results, and pauses funding/outflows on critical mismatches; paging and audited two-person resume remain to be completed.
+- [x] Withdrawal endpoint is explicitly unavailable (HTTP 501); it does not claim to queue a request. Keep it blocked until the jurisdiction-specific custody/legal gate and destination-confirmation requirements are resolved.
 
 ### 3. Bounty funding and refunds are safe
 
@@ -79,21 +79,20 @@ All amounts are integer satoshis. The wallet is a fast balance cache; the ledger
 - Open bounty cancellation refunds the wallet, writes ledger entries, and records an audit entry in one transaction. Claimed bounties are rejected for cancellation.
 - Bounty publication schedules an expiry job in the same database transaction. The worker marks an expired open bounty as expired and refunds its reserved reward to the wallet and ledger atomically.
 - Claiming a bounty schedules claim expiry in the same database transaction. An elapsed active claim is marked expired and reopens its bounty; if the bounty has also expired, the worker refunds the reservation and expires the bounty.
-- A periodic reconciliation job runs hourly and at worker startup, compares wallet caches to ledger-derived balances, checks ledger transactions balance, and records its report in the audit log.
+- A periodic reconciliation job runs hourly and at worker startup, compares wallet caches and aggregate project liabilities to ledger-derived balances and confirmed node funds, accounts for payouts marked `sending`, persists reports, and pauses funding/outflows on a detected shortfall or accounting mismatch. Money-movement flags start paused after migration.
 - Bounty fees use the documented 2% basis-point calculation rounded down with a 1-sat minimum when a nonzero fee rate is configured.
 - Bounty listing applies cursor conditions before ordering and limiting, uses creation time plus bounty ID for stable pages, and rejects malformed cursors with HTTP 400.
-- Unit tests cover authentication, ledger entry validation, GitHub helpers, cancellation and expiry eligibility, fee rounding, and bounty cursor construction. `go test ./...` passed on 2026-10-23.
+- Unit tests cover authentication, ledger entry validation, GitHub helpers, cancellation and expiry eligibility, fee rounding, and bounty cursor construction. `go test ./...` passes. The PostgreSQL integration target covers late/underpaid settlement idempotency, unmatched-receipt quarantine, concurrent bounty reservation, and fail-closed reconciliation pauses.
 
 ## Known gaps to close
 
-- The proposed late-deposit policy is in [ADR-011](../011-late-deposits.md): node-reported expiry, credit known late settlements at the amount received, and quarantine unknown receipts for staff review. It is not implemented yet. Work includes storing node expiry/cancellation, actual received amount and late-settlement marker, unmatched receipts and review, alerting, and crash recovery for an invoice created before its deposit row commits.
-- The proposed withdrawal policy is in [ADR-012](../012-withdrawal-policy.md), and depends on counsel accepting the custody model. It recommends controlled withdrawals of available funds, including a 24-hour deposit hold, limits, destination checks, and a persisted payment attempt. The endpoint currently returns HTTP 501. If counsel approves the policy, implement the withdrawal records, ledger account, server-side checks, payment flow, and kill-switch behavior; otherwise resolve and implement the fallback policy. Terms currently promise withdrawal at any time and must be reconciled with the approved policy.
-- The proposed mismatch response is in [ADR-013](../013-reconciliation-response.md). Reconciliation currently compares wallet caches with ledger balances and checks transaction balance, but does not compare node funds with liabilities, account for in-flight payments, persist reconciliation runs, or enforce a pause. Implement the proposed node-balance calculation, tolerance, `reconciliation_runs` and `system_flags`, fail-closed actions, and alerting. Fill in actual on-call contacts and exercise the two-person resume procedure before beta.
+- Withdrawal is a legal release gate, not an active product promise. The endpoint remains HTTP 501; Terms now say withdrawals are unavailable in preview and must be replaced after counsel chooses the permitted model. If Option A is approved, implement deposit aging, verified destination controls, idempotent persisted attempts, ledger accounting, and the outflow kill switch. If Option B is required, implement and audit the manual return process.
+- ADR-011 and ADR-013 have been accepted and initial code is in place. Known deposit settlements record received amounts and late status; LND cancellation updates expire pending deposits; unmatched invoice receipts are quarantined and audit logged. Reconciliation now compares node balance to project liabilities and net platform fees, accounts for `sending` payouts, persists reports, and pauses new funding on serious mismatches or node-balance errors. Remaining: review tooling and paging for unmatched receipts, observing non-invoice/keysend HTLCs, paging/on-call integration, node reconnect-triggered reconciliation, an audited two-person resume path, and payout sender enforcement once payouts exist.
 - The bounty cursor query has unit coverage for SQL clause order and parameter values. Database-backed coverage for filter/cursor combinations is still needed.
 - State transitions are not yet routed through the single transition function described by the spec; transitions other than cancellation and expiry are not yet audited.
 - The implemented fee math has unit coverage, but fee and routing-cost policy still needs agreement across product docs, UI, and Terms.
-- Terms and Privacy are still drafts with unresolved placeholders, and the legal/regulatory review and M1 audit remain outstanding.
-- The current tests do not exercise database transactions, concurrent funding/reservations, or LND regtest behavior.
+- Terms and Privacy now describe preview limitations and identify counsel decisions, but remain drafts with unresolved entity, jurisdiction, retention, contact, and regulatory answers. Legal/regulatory review and the M1 audit remain outstanding.
+- Database integration coverage remains incomplete for rollback paths, deposit-creation crash recovery, bounty search/filter/cursor queries, and every reconciliation severity. LND regtest coverage, API authorization integration, and crash/reconnect scenarios remain outstanding.
 
 ## What M2 does not complete
 
