@@ -37,7 +37,8 @@ test:
 	go test -v -race -count=1 ./...
 
 test-int:
-	docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from test
+	@docker compose -p satlight-test -f docker-compose.test.yml up -d --wait postgres
+	@trap 'docker compose -p satlight-test -f docker-compose.test.yml down' EXIT; docker compose -p satlight-test -f docker-compose.test.yml run --rm tests
 
 test-ln:
 	@echo "Running Lightning integration tests on regtest..."

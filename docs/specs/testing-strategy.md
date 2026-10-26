@@ -3,7 +3,7 @@
 | Layer | Scope | Tools |
 |---|---|---|
 | Unit | State machine, fee math, ledger invariants, parsers | `go test`, table tests |
-| Integration | DB, queue, webhook processing, API handlers | testcontainers-go |
+| Integration | PostgreSQL settlement, concurrent bounty reservation, reconciliation, then queue/webhook/API handlers | isolated PostgreSQL service through `make test-int` |
 | Lightning | Deposits, payouts, failures on regtest | LND + Polar / docker compose |
 | End to end | Fund, claim, merge, pay through UI | Playwright with mocked GitHub |
 | Property / fuzz | Ledger balance, fee rounding, idempotency | `testing/fuzz`, rapid |

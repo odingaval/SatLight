@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: satlight
+      POSTGRES_PASSWORD: satlight
+      POSTGRES_DB: satlight_test
+    ports:
+      - "55432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U satlight -d satlight_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  tests:
+    image: golang:1.26-alpine
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - satlight_test_go_mod_cache:/go/pkg/mod
+      - satlight_test_go_build_cache:/root/.cache/go-build
+    environment:
+      DATABASE_URL: postgres://satlight:satlight@postgres:5432/satlight_test?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["sh", "-c", "apk add --no-cache git && go test -tags=integration -count=1 ./internal/bounty"]
+
+volumes:
+  satlight_test_go_mod_cache:
+  satlight_test_go_build_cache:
