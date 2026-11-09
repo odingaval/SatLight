@@ -12,6 +12,7 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/joho/godotenv v1.5.1
 	github.com/lightningnetwork/lnd v0.21.4-beta
+	github.com/prometheus/client_golang v1.11.1
 	github.com/riverqueue/river v0.20.0
 	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.20.0
 	github.com/rs/zerolog v1.31.0
@@ -145,7 +146,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/client_golang v1.11.1 // indirect
 	github.com/prometheus/client_model v0.2.0 // indirect
 	github.com/prometheus/common v0.26.0 // indirect
 	github.com/prometheus/procfs v0.6.0 // indirect
