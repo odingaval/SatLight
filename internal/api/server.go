@@ -4,15 +4,21 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/satlight/satlight/internal/auth"
 	"github.com/satlight/satlight/internal/bounty"
@@ -20,6 +26,8 @@ import (
 	"github.com/satlight/satlight/internal/github"
 	"github.com/satlight/satlight/internal/ledger"
 	"github.com/satlight/satlight/internal/lightning"
+	"github.com/satlight/satlight/internal/notify"
+	"github.com/satlight/satlight/internal/payout"
 	"github.com/satlight/satlight/internal/queue"
 )
 
@@ -38,6 +46,8 @@ type Services struct {
 	Lightning *lightning.Service
 	GitHub    *github.Service
 	Queue     *queue.Client
+	Notify    *notify.Service
+	Payout    *payout.Service
 }
 
 func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
@@ -67,8 +77,14 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		OAuthClientSecret: cfg.GitHubOAuthClientSecret,
 	}, pool)
 	queueClient := queue.NewClient(pool)
+	notifySvc := notify.NewService(cfg, pool)
+	payoutSvc := payout.NewService(cfg, pool)
+	payoutSvc.SetDependencies(ledgerSvc, lightningSvc, githubSvc, notifySvc, queueClient)
 
 	bountySvc.SetDependencies(ledgerSvc, queueClient)
+	bountySvc.SetNotifier(notifySvc)
+	githubSvc.SetQueue(queueClient)
+	githubSvc.SetNotifier(notifySvc)
 
 	services := &Services{
 		Auth:      authSvc,
@@ -77,12 +93,14 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		Lightning: lightningSvc,
 		GitHub:    githubSvc,
 		Queue:     queueClient,
+		Notify:    notifySvc,
+		Payout:    payoutSvc,
 	}
 
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.Use(zerologMiddleware(&logger))
-	router.Use(corsMiddleware())
+	router.Use(corsMiddleware(cfg.WebURL))
 
 	s := &Server{
 		cfg:      cfg,
@@ -111,6 +129,7 @@ func (s *Server) CloseLightning() error {
 // WatchLightningInvoices reconnects the invoice stream after transient LND or
 // network failures and settles matching project deposits.
 func (s *Server) WatchLightningInvoices(ctx context.Context) {
+	wasConnected := s.services.Lightning.Connected()
 	for ctx.Err() == nil {
 		if !s.services.Lightning.Connected() {
 			if err := s.ConnectLightning(ctx); err != nil {
@@ -121,6 +140,14 @@ func (s *Server) WatchLightningInvoices(ctx context.Context) {
 				case <-time.After(5 * time.Second):
 				}
 				continue
+			}
+		}
+		if !wasConnected {
+			wasConnected = true
+			// Deposits or payments may have settled while disconnected;
+			// reconcile immediately instead of waiting for the hourly job.
+			if err := s.services.Ledger.RunReconciliation(ctx); err != nil {
+				s.logger.Warn().Err(err).Msg("post-reconnect reconciliation reported a problem")
 			}
 		}
 		err := s.services.Lightning.SubscribeInvoices(ctx, func(update lightning.InvoiceUpdate) error {
@@ -145,6 +172,7 @@ func (s *Server) WatchLightningInvoices(ctx context.Context) {
 		}
 		if err != nil {
 			s.logger.Warn().Err(err).Msg("Lightning invoice stream interrupted; reconnecting")
+			wasConnected = false
 		}
 		select {
 		case <-ctx.Done():
@@ -158,6 +186,7 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+	s.router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	v1 := s.router.Group("/api/v1")
 	{
@@ -171,18 +200,22 @@ func (s *Server) setupRoutes() {
 		v1.DELETE("/bounties/:id/claim", s.authRequired(), s.handleReleaseClaim)
 		v1.POST("/bounties/:id/cancel", s.authRequired(), s.handleCancelBounty)
 		v1.POST("/bounties/:id/dispute", s.authRequired(), s.handleDisputeBounty)
+		v1.POST("/disputes/:id/resolve", s.authRequired(), s.handleResolveDispute)
 
 		v1.POST("/projects", s.authRequired(), s.handleCreateProject)
 		v1.GET("/projects/:id/wallet", s.authRequired(), s.handleGetWallet)
 		v1.POST("/projects/:id/deposits", s.authRequired(), s.handleCreateDeposit)
 		v1.POST("/projects/:id/withdrawals", s.authRequired(), s.handleCreateWithdrawal)
 		v1.POST("/projects/:id/bounties", s.authRequired(), s.handleCreateBounty)
+		v1.PUT("/projects/:id/notifications", s.authRequired(), s.handleUpdateProjectNotifications)
 
 		v1.GET("/me", s.authRequired(), s.handleGetMe)
 		v1.PUT("/me/payout-destination", s.authRequired(), s.handleSetPayoutDestination)
 		v1.GET("/me/payouts", s.authRequired(), s.handleGetPayouts)
+		v1.GET("/me/claims", s.authRequired(), s.handleGetMyClaims)
 
 		v1.GET("/payouts/claim/:token", s.handleRedeemPayoutClaim)
+		v1.GET("/payouts/claim/callback", s.handleWithdrawCallback)
 
 		v1.POST("/webhooks/github", s.handleGitHubWebhook)
 	}
@@ -234,7 +267,7 @@ func (s *Server) handleGitHubCallback(c *gin.Context) {
 		c.Redirect(http.StatusFound, strings.TrimRight(s.cfg.WebURL, "/")+"/?github=failed#register")
 		return
 	}
-	userID, err := s.services.Auth.UpsertUser(ctx, githubUser.GetID(), githubUser.GetLogin(), githubUser.GetEmail())
+	userID, err := s.services.Auth.UpsertUser(ctx, githubUser.GetID(), githubUser.GetLogin(), githubUser.GetEmail(), githubUser.GetCreatedAt().Time)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to save GitHub user")
 		c.Redirect(http.StatusFound, strings.TrimRight(s.cfg.WebURL, "/")+"/?github=failed#register")
@@ -254,6 +287,28 @@ func (s *Server) authRequired() gin.HandlerFunc {
 	return s.services.Auth.Middleware()
 }
 
+// idempotencyKey validates the Idempotency-Key header required by all
+// money-moving POST endpoints. It writes the 400 response on failure.
+func idempotencyKey(c *gin.Context) (string, bool) {
+	key := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if len(key) < 8 || len(key) > 128 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_IDEMPOTENCY_KEY", "message": "Idempotency-Key must contain 8 to 128 characters"}})
+		return "", false
+	}
+	return key, true
+}
+
+// requestHash returns a stable hash of a bound request struct so that key
+// reuse with different request data can be rejected (HTTP 409).
+func requestHash(v any) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func zerologMiddleware(logger *zerolog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -268,9 +323,12 @@ func zerologMiddleware(logger *zerolog.Logger) gin.HandlerFunc {
 	}
 }
 
-func corsMiddleware() gin.HandlerFunc {
+func corsMiddleware(allowedOrigin string) gin.HandlerFunc {
+	if allowedOrigin == "" {
+		allowedOrigin = "*"
+	}
 	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key")
 		if c.Request.Method == "OPTIONS" {
@@ -383,7 +441,12 @@ func (s *Server) handleClaimBounty(c *gin.Context) {
 		return
 	}
 
-	claim, err := s.services.Bounty.ClaimBounty(c.Request.Context(), id, userID)
+	key, ok := idempotencyKey(c)
+	if !ok {
+		return
+	}
+
+	claim, created, err := s.services.Bounty.ClaimBounty(c.Request.Context(), id, userID, key)
 	if err != nil {
 		switch err {
 		case bounty.ErrBountyNotFound:
@@ -392,6 +455,18 @@ func (s *Server) handleClaimBounty(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "NOT_OPEN", "message": "bounty is not open for claims"}})
 		case bounty.ErrBountyAlreadyClaimed:
 			c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "ALREADY_CLAIMED", "message": "bounty already claimed"}})
+		case bounty.ErrUserBanned:
+			c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "USER_BANNED", "message": "this account is banned from claiming bounties"}})
+		case bounty.ErrProjectFrozen:
+			c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "PROJECT_FROZEN", "message": "this project is frozen and not accepting claims"}})
+		case bounty.ErrSelfClaim:
+			c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "SELF_CLAIM", "message": "project owners cannot claim their own bounties"}})
+		case bounty.ErrClaimantAccountTooNew:
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": gin.H{"code": "ACCOUNT_TOO_NEW", "message": "this GitHub account is too new to claim bounties"}})
+		case bounty.ErrTooManyActiveClaims:
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": gin.H{"code": "TOO_MANY_CLAIMS", "message": "release or complete an active claim before claiming another bounty"}})
+		case bounty.ErrPayoutDestinationMissing:
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": gin.H{"code": "PAYOUT_DESTINATION_MISSING", "message": "set a Lightning payout destination before claiming"}})
 		default:
 			s.logger.Error().Err(err).Msg("failed to claim bounty")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to claim bounty"}})
@@ -399,7 +474,11 @@ func (s *Server) handleClaimBounty(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, claim)
+	if created {
+		c.JSON(http.StatusCreated, claim)
+	} else {
+		c.JSON(http.StatusOK, claim)
+	}
 }
 
 func (s *Server) handleReleaseClaim(c *gin.Context) {
@@ -483,12 +562,60 @@ func (s *Server) handleDisputeBounty(c *gin.Context) {
 	}
 
 	if err := s.services.Bounty.DisputeBounty(c.Request.Context(), id, userID, req.Reason, req.Evidence); err != nil {
-		s.logger.Error().Err(err).Msg("failed to create dispute")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to create dispute"}})
+		switch err {
+		case bounty.ErrBountyNotFound:
+			c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "NOT_FOUND", "message": "bounty not found"}})
+		case bounty.ErrInvalidState:
+			c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "INVALID_STATE", "message": "bounty cannot be disputed in its current state"}})
+		default:
+			s.logger.Error().Err(err).Msg("failed to create dispute")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to create dispute"}})
+		}
 		return
 	}
 
 	c.Status(http.StatusCreated)
+}
+
+func (s *Server) handleResolveDispute(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_ID", "message": "invalid dispute id"}})
+		return
+	}
+
+	userID, ok := auth.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "unauthorized"}})
+		return
+	}
+
+	var req struct {
+		Resolution string `json:"resolution" binding:"required,oneof=resolved_pay resolved_cancel resolved_other"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": err.Error()}})
+		return
+	}
+
+	err = s.services.Bounty.ResolveDispute(c.Request.Context(), id, userID, req.Resolution)
+	switch err {
+	case nil:
+		c.JSON(http.StatusOK, gin.H{"id": id, "status": req.Resolution})
+	case bounty.ErrDisputeNotFound:
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "NOT_FOUND", "message": "dispute not found"}})
+	case bounty.ErrNotAuthorized:
+		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "FORBIDDEN", "message": "only the project owner can resolve this dispute"}})
+	case bounty.ErrDisputeClosed:
+		c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "DISPUTE_CLOSED", "message": "dispute is already resolved"}})
+	case bounty.ErrInvalidState:
+		c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "INVALID_STATE", "message": "bounty is no longer disputed"}})
+	case bounty.ErrDisputePayNotReady:
+		c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "NO_VERIFIED_MERGE", "message": "cannot release payout without a verified merge"}})
+	default:
+		s.logger.Error().Err(err).Msg("failed to resolve dispute")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to resolve dispute"}})
+	}
 }
 
 func (s *Server) handleCreateProject(c *gin.Context) {
@@ -519,18 +646,19 @@ func (s *Server) handleCreateProject(c *gin.Context) {
 	}
 
 	var project struct {
-		ID                   int64  `json:"id"`
-		OwnerUserID          int64  `json:"owner_user_id"`
-		GitHubInstallationID int64  `json:"github_installation_id"`
-		RepoFullName         string `json:"repo_full_name"`
-		Status               string `json:"status"`
+		ID                   int64     `json:"id"`
+		OwnerUserID          int64     `json:"owner_user_id"`
+		GitHubInstallationID int64     `json:"github_installation_id"`
+		RepoFullName         string    `json:"repo_full_name"`
+		Status               string    `json:"status"`
+		CreatedAt            time.Time `json:"created_at"`
 	}
 	err = s.pool.QueryRow(c.Request.Context(), `
 		INSERT INTO projects (owner_user_id, github_installation_id, repo_full_name)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (repo_full_name) DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id, github_installation_id = EXCLUDED.github_installation_id
 		RETURNING id, owner_user_id, github_installation_id, repo_full_name, status, created_at
-	`, userID, req.InstallationID, req.RepoFullName).Scan(&project.ID, &project.OwnerUserID, &project.GitHubInstallationID, &project.RepoFullName, &project.Status)
+	`, userID, req.InstallationID, req.RepoFullName).Scan(&project.ID, &project.OwnerUserID, &project.GitHubInstallationID, &project.RepoFullName, &project.Status, &project.CreatedAt)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to create project")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to create project"}})
@@ -549,6 +677,52 @@ func (s *Server) handleCreateProject(c *gin.Context) {
 	c.JSON(http.StatusCreated, project)
 }
 
+func (s *Server) handleUpdateProjectNotifications(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_ID", "message": "invalid project id"}})
+		return
+	}
+	userID, ok := auth.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "unauthorized"}})
+		return
+	}
+	project, err := s.getProjectForUser(c.Request.Context(), userID, id)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "FORBIDDEN", "message": "not authorized"}})
+		return
+	}
+	var req struct {
+		WebhookURL    *string `json:"webhook_url"`
+		WebhookSecret *string `json:"webhook_secret"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": err.Error()}})
+		return
+	}
+	var urlVal, secretVal any
+	if req.WebhookURL != nil && strings.TrimSpace(*req.WebhookURL) != "" {
+		u, err := url.Parse(strings.TrimSpace(*req.WebhookURL))
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_URL", "message": "webhook_url must be an http(s) URL"}})
+			return
+		}
+		urlVal = u.String()
+	}
+	if req.WebhookSecret != nil && *req.WebhookSecret != "" {
+		secretVal = *req.WebhookSecret
+	}
+	if _, err := s.pool.Exec(c.Request.Context(), `
+		UPDATE projects SET notification_webhook_url = $1, notification_webhook_secret = $2 WHERE id = $3
+	`, urlVal, secretVal, project.ID); err != nil {
+		s.logger.Error().Err(err).Msg("failed to update project notifications")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to update project notifications"}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"id": project.ID, "webhook_configured": urlVal != nil})
+}
+
 func (s *Server) handleGetWallet(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -562,7 +736,7 @@ func (s *Server) handleGetWallet(c *gin.Context) {
 		return
 	}
 
-	project, err := s.getUserProject(c.Request.Context(), userID, id)
+	project, err := s.getProjectForUser(c.Request.Context(), userID, id)
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "FORBIDDEN", "message": "not authorized to view this wallet"}})
 		return
@@ -591,7 +765,7 @@ func (s *Server) handleCreateDeposit(c *gin.Context) {
 		return
 	}
 
-	project, err := s.getUserProject(c.Request.Context(), userID, id)
+	project, err := s.getProjectForUser(c.Request.Context(), userID, id)
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "FORBIDDEN", "message": "not authorized to fund this project"}})
 		return
@@ -604,14 +778,13 @@ func (s *Server) handleCreateDeposit(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": err.Error()}})
 		return
 	}
-	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
-	if len(idempotencyKey) < 8 || len(idempotencyKey) > 128 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_IDEMPOTENCY_KEY", "message": "Idempotency-Key must contain 8 to 128 characters"}})
+	idemKey, ok := idempotencyKey(c)
+	if !ok {
 		return
 	}
 	var invoiceCreationErr error
 	var lightningUnavailable bool
-	deposit, created, err := s.services.Bounty.GetOrCreateDeposit(c.Request.Context(), project.ID, idempotencyKey, req.AmountSats, func(ctx context.Context) (string, []byte, time.Time, error) {
+	deposit, created, err := s.services.Bounty.GetOrCreateDeposit(c.Request.Context(), project.ID, idemKey, req.AmountSats, func(ctx context.Context) (string, []byte, time.Time, error) {
 		if !s.services.Lightning.Connected() {
 			lightningUnavailable = true
 			return "", nil, time.Time{}, errors.New("lightning invoice service is unavailable")
@@ -661,7 +834,7 @@ func (s *Server) handleCreateWithdrawal(c *gin.Context) {
 		return
 	}
 
-	_, err = s.getUserProject(c.Request.Context(), userID, id)
+	_, err = s.getProjectForUser(c.Request.Context(), userID, id)
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "FORBIDDEN", "message": "not authorized to withdraw from this project"}})
 		return
@@ -682,7 +855,7 @@ func (s *Server) handleCreateBounty(c *gin.Context) {
 		return
 	}
 
-	project, err := s.getUserProject(c.Request.Context(), userID, id)
+	project, err := s.getProjectForUser(c.Request.Context(), userID, id)
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "FORBIDDEN", "message": "not authorized to create bounties for this project"}})
 		return
@@ -698,6 +871,11 @@ func (s *Server) handleCreateBounty(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": err.Error()}})
+		return
+	}
+
+	key, ok := idempotencyKey(c)
+	if !ok {
 		return
 	}
 
@@ -719,9 +897,11 @@ func (s *Server) handleCreateBounty(c *gin.Context) {
 		Difficulty:        req.Difficulty,
 		RewardSats:        req.RewardSats,
 		ExpiresAt:         expiresAt,
+		IdempotencyKey:    key,
+		IdempotencyHash:   requestHash(req),
 	}
 
-	b, err := s.services.Bounty.CreateBounty(c.Request.Context(), params)
+	b, created, err := s.services.Bounty.CreateBounty(c.Request.Context(), params)
 	if err != nil {
 		if errors.Is(err, bounty.ErrFundingPaused) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "FUNDING_PAUSED", "message": "project funding is temporarily paused"}})
@@ -735,12 +915,32 @@ func (s *Server) handleCreateBounty(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_EXPIRY", "message": "expires_at must be in the future"}})
 			return
 		}
+		if errors.Is(err, bounty.ErrDuplicateIssueBounty) {
+			c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "DUPLICATE_ISSUE", "message": "this repository issue already has a bounty"}})
+			return
+		}
+		if errors.Is(err, bounty.ErrProjectFrozen) {
+			c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "PROJECT_FROZEN", "message": "this project is frozen and cannot publish bounties"}})
+			return
+		}
+		if errors.Is(err, bounty.ErrProjectNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "NOT_FOUND", "message": "project not found"}})
+			return
+		}
+		if errors.Is(err, bounty.ErrIdempotencyConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": gin.H{"code": "IDEMPOTENCY_KEY_REUSED", "message": "Idempotency-Key was already used with different request data"}})
+			return
+		}
 		s.logger.Error().Err(err).Msg("failed to create bounty")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to create bounty"}})
 		return
 	}
 
-	c.JSON(http.StatusCreated, b)
+	if created {
+		c.JSON(http.StatusCreated, b)
+	} else {
+		c.JSON(http.StatusOK, b)
+	}
 }
 
 func (s *Server) handleGetMe(c *gin.Context) {
@@ -789,6 +989,9 @@ func (s *Server) handleSetPayoutDestination(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to update payout destination"}})
 		return
 	}
+	if err := s.services.Notify.NotifyDestinationChanged(c.Request.Context(), userID); err != nil {
+		s.logger.Error().Err(err).Msg("failed to send destination-change notification")
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "payout destination updated"})
 }
@@ -801,9 +1004,10 @@ func (s *Server) handleGetPayouts(c *gin.Context) {
 	}
 
 	rows, err := s.pool.Query(c.Request.Context(), `
-		SELECT p.id, p.bounty_id, p.amount_sats, p.fee_sats, p.status, p.settled_at, b.title, b.repo_full_name
+		SELECT p.id, p.bounty_id, p.amount_sats, p.fee_sats, p.status, p.settled_at, p.claim_link_token, b.title, pr.repo_full_name
 		FROM payouts p
 		JOIN bounties b ON p.bounty_id = b.id
+		JOIN projects pr ON b.project_id = pr.id
 		WHERE p.user_id = $1
 		ORDER BY p.created_at DESC
 	`, userID)
@@ -823,13 +1027,14 @@ func (s *Server) handleGetPayouts(c *gin.Context) {
 			FeeSats      int64
 			Status       string
 			SettledAt    *time.Time
+			ClaimLink    *string
 			Title        string
 			RepoFullName string
 		}
-		if err := rows.Scan(&p.ID, &p.BountyID, &p.AmountSats, &p.FeeSats, &p.Status, &p.SettledAt, &p.Title, &p.RepoFullName); err != nil {
+		if err := rows.Scan(&p.ID, &p.BountyID, &p.AmountSats, &p.FeeSats, &p.Status, &p.SettledAt, &p.ClaimLink, &p.Title, &p.RepoFullName); err != nil {
 			continue
 		}
-		payouts = append(payouts, map[string]interface{}{
+		entry := map[string]interface{}{
 			"id":             p.ID,
 			"bounty_id":      p.BountyID,
 			"amount_sats":    p.AmountSats,
@@ -838,36 +1043,111 @@ func (s *Server) handleGetPayouts(c *gin.Context) {
 			"settled_at":     p.SettledAt,
 			"title":          p.Title,
 			"repo_full_name": p.RepoFullName,
-		})
+		}
+		if p.ClaimLink != nil {
+			entry["claim_link_token"] = *p.ClaimLink
+		}
+		payouts = append(payouts, entry)
 	}
 
 	c.JSON(http.StatusOK, payouts)
 }
 
-func (s *Server) handleRedeemPayoutClaim(c *gin.Context) {
-	token := c.Param("token")
-	if token == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_TOKEN", "message": "invalid claim token"}})
+func (s *Server) handleGetMyClaims(c *gin.Context) {
+	userID, ok := auth.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "unauthorized"}})
 		return
 	}
-
-	var claimLink string
-	err := s.pool.QueryRow(c.Request.Context(), `
-		SELECT claim_link_token FROM payouts WHERE claim_link_token = $1
-	`, token).Scan(&claimLink)
+	rows, err := s.pool.Query(c.Request.Context(), `
+		SELECT c.id, c.bounty_id, c.status, c.expires_at, b.title, b.reward_sats, b.state, pr.repo_full_name
+		FROM claims c
+		JOIN bounties b ON c.bounty_id = b.id
+		JOIN projects pr ON b.project_id = pr.id
+		WHERE c.user_id = $1
+		ORDER BY c.created_at DESC
+	`, userID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "NOT_FOUND", "message": "claim link not found"}})
+		s.logger.Error().Err(err).Msg("failed to get claims")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to get claims"}})
 		return
 	}
+	defer rows.Close()
 
+	claims := []map[string]interface{}{}
+	for rows.Next() {
+		var cl struct {
+			ID           int64
+			BountyID     int64
+			Status       string
+			ExpiresAt    time.Time
+			Title        string
+			RewardSats   int64
+			BountyState  string
+			RepoFullName string
+		}
+		if err := rows.Scan(&cl.ID, &cl.BountyID, &cl.Status, &cl.ExpiresAt, &cl.Title, &cl.RewardSats, &cl.BountyState, &cl.RepoFullName); err != nil {
+			continue
+		}
+		claims = append(claims, map[string]interface{}{
+			"id":             cl.ID,
+			"bounty_id":      cl.BountyID,
+			"status":         cl.Status,
+			"expires_at":     cl.ExpiresAt,
+			"title":          cl.Title,
+			"reward_sats":    cl.RewardSats,
+			"bounty_state":   cl.BountyState,
+			"repo_full_name": cl.RepoFullName,
+		})
+	}
+	c.JSON(http.StatusOK, claims)
+}
+
+func (s *Server) handleRedeemPayoutClaim(c *gin.Context) {
+	token := strings.TrimSpace(c.Param("token"))
+	if token == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "ERROR", "reason": "claim token is required"})
+		return
+	}
+	req, err := s.services.Payout.GetWithdrawRequest(c.Request.Context(), token)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"status": "ERROR", "reason": "unknown or already-used claim link"})
+		return
+	}
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to load claim link")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "ERROR", "reason": "internal error"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"callback_url":       "https://example.com/lnurl-withdraw", // placeholder
-		"k1":                 claimLink,
 		"tag":                "withdrawRequest",
-		"minWithdrawable":    1000,
-		"maxWithdrawable":    100000000,
-		"defaultDescription": "Satlight payout",
+		"callback":           req.CallbackURL,
+		"k1":                 req.Token,
+		"defaultDescription": req.DefaultDescription,
+		"minWithdrawable":    req.MinWithdrawableMs,
+		"maxWithdrawable":    req.MaxWithdrawableMs,
 	})
+}
+
+func (s *Server) handleWithdrawCallback(c *gin.Context) {
+	k1 := strings.TrimSpace(c.Query("k1"))
+	pr := strings.TrimSpace(c.Query("pr"))
+	if k1 == "" || pr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "ERROR", "reason": "k1 and pr are required"})
+		return
+	}
+	err := s.services.Payout.RedeemClaimLink(c.Request.Context(), k1, pr)
+	switch {
+	case err == nil:
+		c.JSON(http.StatusOK, gin.H{"status": "OK"})
+	case errors.Is(err, sql.ErrNoRows) || errors.Is(err, payout.ErrClaimLinkUsed):
+		c.JSON(http.StatusNotFound, gin.H{"status": "ERROR", "reason": "unknown or already-used claim link"})
+	case errors.Is(err, payout.ErrInvoiceAmountMismatch):
+		c.JSON(http.StatusOK, gin.H{"status": "ERROR", "reason": err.Error()})
+	default:
+		s.logger.Error().Err(err).Msg("claim-link redemption failed")
+		c.JSON(http.StatusOK, gin.H{"status": "ERROR", "reason": "payment failed; the link remains usable"})
+	}
 }
 
 func (s *Server) handleGitHubWebhook(c *gin.Context) {
@@ -893,14 +1173,27 @@ func (s *Server) handleGitHubWebhook(c *gin.Context) {
 		return
 	}
 
-	err = s.services.GitHub.ProcessWebhook(c.Request.Context(), deliveryID, event, body)
+	// Record and enqueue; the worker verifies against the GitHub API and
+	// applies lifecycle changes asynchronously with retries.
+	_, err = s.services.GitHub.RecordWebhookDelivery(c.Request.Context(), deliveryID, event, body)
 	if err != nil {
-		s.logger.Error().Err(err).Str("delivery_id", deliveryID).Msg("failed to process webhook")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to process webhook"}})
+		s.logger.Error().Err(err).Str("delivery_id", deliveryID).Msg("failed to record webhook")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to record webhook"}})
 		return
 	}
 
 	c.Status(http.StatusOK)
+}
+
+func (s *Server) getProjectForUser(ctx context.Context, userID int64, projectID int64) (*bounty.Project, error) {
+	project, err := s.services.Bounty.GetProjectByID(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	if project.OwnerUserID != userID {
+		return nil, errors.New("not authorized")
+	}
+	return project, nil
 }
 
 func (s *Server) getUserProject(ctx context.Context, userID int64, bountyID int64) (*bounty.Project, error) {
