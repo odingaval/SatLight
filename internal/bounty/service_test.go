@@ -104,6 +104,79 @@ func TestBuildListBountiesQueryPlacesCursorBeforeOrderAndLimit(t *testing.T) {
 	}
 }
 
+func TestCanDisputeBounty(t *testing.T) {
+	tests := []struct {
+		state string
+		want  bool
+	}{
+		{state: "open", want: true},
+		{state: "claimed", want: true},
+		{state: "in_review", want: true},
+		{state: "draft", want: false},
+		{state: "merged", want: false},
+		{state: "paid", want: false},
+		{state: "payout_failed", want: false},
+		{state: "expired", want: false},
+		{state: "cancelled", want: false},
+		{state: "disputed", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.state, func(t *testing.T) {
+			if got := canDisputeBounty(tt.state); got != tt.want {
+				t.Errorf("canDisputeBounty(%q) = %t, want %t", tt.state, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidBountyTransition(t *testing.T) {
+	valid := [][2]string{
+		{"draft", "open"},
+		{"open", "claimed"}, {"open", "cancelled"}, {"open", "expired"}, {"open", "disputed"},
+		{"claimed", "open"}, {"claimed", "in_review"}, {"claimed", "merged"}, {"claimed", "expired"}, {"claimed", "disputed"},
+		{"in_review", "claimed"}, {"in_review", "merged"}, {"in_review", "disputed"},
+		{"merged", "paid"}, {"merged", "payout_failed"},
+		{"payout_failed", "merged"},
+		{"disputed", "open"}, {"disputed", "claimed"}, {"disputed", "in_review"}, {"disputed", "merged"}, {"disputed", "cancelled"},
+	}
+	for _, tt := range valid {
+		if !validBountyTransition(tt[0], tt[1]) {
+			t.Errorf("validBountyTransition(%q, %q) = false, want true", tt[0], tt[1])
+		}
+	}
+	invalid := [][2]string{
+		{"draft", "claimed"}, {"draft", "paid"},
+		{"open", "open"}, {"open", "paid"}, {"open", "merged"},
+		{"claimed", "paid"}, {"claimed", "cancelled"},
+		{"in_review", "open"}, {"in_review", "paid"},
+		{"merged", "open"}, {"merged", "cancelled"}, {"merged", "disputed"},
+		{"payout_failed", "paid"}, {"payout_failed", "open"},
+		{"paid", "open"}, {"paid", "merged"},
+		{"expired", "open"}, {"cancelled", "open"},
+		{"disputed", "paid"}, {"disputed", "expired"},
+		{"", "open"}, {"open", ""},
+	}
+	for _, tt := range invalid {
+		if validBountyTransition(tt[0], tt[1]) {
+			t.Errorf("validBountyTransition(%q, %q) = true, want false", tt[0], tt[1])
+		}
+	}
+}
+
+func TestValidDisputeResolution(t *testing.T) {
+	for _, valid := range []string{"resolved_pay", "resolved_cancel", "resolved_other"} {
+		if !validDisputeResolution(valid) {
+			t.Errorf("validDisputeResolution(%q) = false, want true", valid)
+		}
+	}
+	for _, invalid := range []string{"", "open", "resolved", "RESOLVED_PAY"} {
+		if validDisputeResolution(invalid) {
+			t.Errorf("validDisputeResolution(%q) = true, want false", invalid)
+		}
+	}
+}
+
 func TestBountyCursorRoundTripAndValidation(t *testing.T) {
 	createdAt := time.Date(2026, 10, 23, 12, 30, 0, 123456789, time.FixedZone("EAT", 3*60*60))
 	wantTime := createdAt.UTC()
