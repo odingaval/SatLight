@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
@@ -73,15 +74,46 @@ func main() {
 	}
 	log.Info().Int64("project_id", projectID).Msg("Created demo project")
 
-	_, err = pool.Exec(ctx, `
+	var existingBounties int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM bounties WHERE project_id = $1`, projectID).Scan(&existingBounties); err != nil {
+		log.Fatal().Err(err).Msg("failed to check seeded bounties")
+	}
+	if existingBounties > 0 {
+		log.Info().Msg("Demo data already seeded; skipping")
+		fmt.Println("\nDemo data already present; nothing to do.")
+		return
+	}
+
+	// The ledger is append-only, so seeding writes each movement once: a
+	// deposit transaction funding the wallet, then one reservation
+	// transaction per bounty. Reruns exit above instead of double-counting.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to begin seed transaction")
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `
 		INSERT INTO wallets (project_id, available_sats, reserved_sats)
-		VALUES ($1, 1000000, 0)
-		ON CONFLICT (project_id) DO UPDATE SET available_sats = 1000000, reserved_sats = 0
+		VALUES ($1, 0, 0)
+		ON CONFLICT (project_id) DO UPDATE SET available_sats = 0, reserved_sats = 0
 	`, projectID)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create wallet")
 	}
-	log.Info().Msg("Created demo wallet with 1,000,000 sats")
+
+	depositTx := uuid.NewString()
+	_, err = tx.Exec(ctx, `
+		INSERT INTO ledger_entries (tx_id, account, direction, amount_sats, ref_type, ref_id)
+		VALUES ($1, 'node:liquidity', 'debit', 1000000, 'seed', NULL),
+		       ($1, 'project:' || $2::text || ':available', 'credit', 1000000, 'seed', NULL)
+	`, depositTx, projectID)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to seed deposit ledger entries")
+	}
+	if _, err := tx.Exec(ctx, `UPDATE wallets SET available_sats = 1000000 WHERE project_id = $1`, projectID); err != nil {
+		log.Fatal().Err(err).Msg("failed to fund demo wallet")
+	}
 
 	bounties := []struct {
 		issueNumber int
@@ -97,18 +129,34 @@ func main() {
 		{5, "Add dark mode support", "Add a dark mode toggle to the UI with proper persistence in localStorage.", "medium", 30000},
 	}
 
+	var totalReserved int64
 	for _, b := range bounties {
 		var bountyID int64
-		err = pool.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			INSERT INTO bounties (project_id, github_issue_number, title, description, difficulty, reward_sats, fee_sats, state, expires_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', now() + interval '90 days')
-			ON CONFLICT (project_id, github_issue_number) DO UPDATE SET title = EXCLUDED.title
 			RETURNING id
 		`, projectID, b.issueNumber, b.title, b.description, b.difficulty, b.reward, (b.reward*200)/10000).Scan(&bountyID)
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to create bounty")
 		}
+		reserveTx := uuid.NewString()
+		_, err = tx.Exec(ctx, `
+			INSERT INTO ledger_entries (tx_id, account, direction, amount_sats, ref_type, ref_id)
+			VALUES ($1, 'project:' || $2::text || ':available', 'debit', $4, 'bounty_reserve', $3),
+			       ($1, 'project:' || $2::text || ':reserved', 'credit', $4, 'bounty_reserve', $3)
+		`, reserveTx, projectID, bountyID, b.reward)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to seed bounty reservation ledger entries")
+		}
+		totalReserved += b.reward
 		log.Info().Int64("bounty_id", bountyID).Str("title", b.title).Msg("Created demo bounty")
+	}
+	if _, err := tx.Exec(ctx, `UPDATE wallets SET available_sats = available_sats - $1, reserved_sats = reserved_sats + $1 WHERE project_id = $2`, totalReserved, projectID); err != nil {
+		log.Fatal().Err(err).Msg("failed to reserve demo bounty funds")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Fatal().Err(err).Msg("failed to commit seed transaction")
 	}
 
 	log.Info().Msg("Database seeded successfully!")
@@ -116,5 +164,5 @@ func main() {
 	fmt.Println("  Maintainer: github_id=12345, lightning=maintainer@wallet.example")
 	fmt.Println("  Contributor: github_id=67890, lightning=contributor@wallet.example")
 	fmt.Println("\nDemo project: demo/repo (5 bounties created)")
-	fmt.Println("Demo wallet: 1,000,000 sats available")
+	fmt.Printf("Demo wallet: %d sats available, %d sats reserved (ledger-backed)\n", 1000000-totalReserved, totalReserved)
 }

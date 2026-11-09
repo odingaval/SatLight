@@ -27,7 +27,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["sh", "-c", "apk add --no-cache git && go test -tags=integration -count=1 ./internal/bounty"]
+    command: ["sh", "-c", "apk add --no-cache git && go test -tags=integration -count=1 -p 1 ./internal/..."]
 
 volumes:
   satlight_test_go_mod_cache:
