@@ -80,11 +80,11 @@ docker-down:
 
 migrate-up:
 	@echo "Running migrations..."
-	@go run ./cmd/migrate up
+	@go run ./cmd/migrate -dir=up
 
 migrate-down:
 	@echo "Rolling back last migration..."
-	@go run ./cmd/migrate down
+	@go run ./cmd/migrate -dir=down
 
 generate:
 	@echo "Generating code..."

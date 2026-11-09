@@ -13,8 +13,19 @@ type Client struct {
 	*river.Client[pgx.Tx]
 }
 
+// NewClient returns an insert-only River client. It registers every job kind
+// (required by River even for inserts) with service-less workers; jobs are
+// executed by the worker binary, never by this client, so Start must never be
+// called on it.
 func NewClient(pool *pgxpool.Pool) *Client {
 	driver := riverpgxv5.New(pool)
+	workers := river.NewWorkers()
+	river.AddWorker(workers, &ProcessPayoutJob{})
+	river.AddWorker(workers, &ProcessWebhookJob{})
+	river.AddWorker(workers, &SendWebhookJob{})
+	river.AddWorker(workers, &ReconciliationJob{})
+	river.AddWorker(workers, &ClaimExpiryJob{})
+	river.AddWorker(workers, &BountyExpiryJob{})
 	client, err := river.NewClient(driver, &river.Config{
 		Queues: map[string]river.QueueConfig{
 			river.QueueDefault: {MaxWorkers: 10},
@@ -22,6 +33,7 @@ func NewClient(pool *pgxpool.Pool) *Client {
 			"webhooks":         {MaxWorkers: 10},
 			"reconciliation":   {MaxWorkers: 1},
 		},
+		Workers: workers,
 	})
 	if err != nil {
 		panic(err)
@@ -48,17 +60,41 @@ func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args river.JobArgs, op
 }
 
 type ProcessPayoutArgs struct {
-	PayoutID int64 `json:"payout_id"`
+	BountyID int64 `json:"bounty_id"`
 }
 
 func (ProcessPayoutArgs) Kind() string { return "process_payout" }
 
 type ProcessPayoutJob struct {
 	river.WorkerDefaults[ProcessPayoutArgs]
+	Service PayoutProcessor
+}
+
+type PayoutProcessor interface {
+	ProcessBountyPayout(ctx context.Context, bountyID int64) error
 }
 
 func (j *ProcessPayoutJob) Work(ctx context.Context, job *river.Job[ProcessPayoutArgs]) error {
-	return nil
+	return j.Service.ProcessBountyPayout(ctx, job.Args.BountyID)
+}
+
+type SendWebhookArgs struct {
+	DeliveryID int64 `json:"delivery_id"`
+}
+
+func (SendWebhookArgs) Kind() string { return "send_webhook" }
+
+type SendWebhookJob struct {
+	river.WorkerDefaults[SendWebhookArgs]
+	Service WebhookSender
+}
+
+type WebhookSender interface {
+	SendWebhookDelivery(ctx context.Context, deliveryID int64) error
+}
+
+func (j *SendWebhookJob) Work(ctx context.Context, job *river.Job[SendWebhookArgs]) error {
+	return j.Service.SendWebhookDelivery(ctx, job.Args.DeliveryID)
 }
 
 type ProcessWebhookArgs struct {
@@ -69,10 +105,15 @@ func (ProcessWebhookArgs) Kind() string { return "process_webhook" }
 
 type ProcessWebhookJob struct {
 	river.WorkerDefaults[ProcessWebhookArgs]
+	Service WebhookProcessor
+}
+
+type WebhookProcessor interface {
+	ProcessWebhookDelivery(ctx context.Context, deliveryID string) error
 }
 
 func (j *ProcessWebhookJob) Work(ctx context.Context, job *river.Job[ProcessWebhookArgs]) error {
-	return nil
+	return j.Service.ProcessWebhookDelivery(ctx, job.Args.DeliveryID)
 }
 
 type ReconciliationArgs struct{}

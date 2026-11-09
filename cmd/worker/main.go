@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -14,8 +15,11 @@ import (
 	"github.com/satlight/satlight/internal/bounty"
 	"github.com/satlight/satlight/internal/config"
 	"github.com/satlight/satlight/internal/db"
+	"github.com/satlight/satlight/internal/github"
 	"github.com/satlight/satlight/internal/ledger"
 	"github.com/satlight/satlight/internal/lightning"
+	"github.com/satlight/satlight/internal/notify"
+	"github.com/satlight/satlight/internal/payout"
 	"github.com/satlight/satlight/internal/queue"
 )
 
@@ -61,9 +65,29 @@ func main() {
 	bountyService := bounty.NewService(cfg, pool)
 	bountyService.SetDependencies(ledgerService, nil)
 
+	appID, err := strconv.ParseInt(cfg.GitHubAppID, 10, 64)
+	if err != nil && cfg.GitHubAppID != "" {
+		log.Warn().Err(err).Msg("invalid GitHub App ID")
+	}
+	githubService := github.NewService(&github.Config{
+		AppID:             appID,
+		PrivateKeyPath:    cfg.GitHubAppPrivateKeyPath,
+		WebhookSecret:     cfg.GitHubWebhookSecret,
+		OAuthClientID:     cfg.GitHubOAuthClientID,
+		OAuthClientSecret: cfg.GitHubOAuthClientSecret,
+	}, pool)
+
+	notifyService := notify.NewService(cfg, pool)
+	queueClient := queue.NewClient(pool)
+	githubService.SetQueue(queueClient)
+	githubService.SetNotifier(notifyService)
+	payoutService := payout.NewService(cfg, pool)
+	payoutService.SetDependencies(ledgerService, lightningService, githubService, notifyService, queueClient)
+
 	workers := river.NewWorkers()
-	river.AddWorker(workers, &queue.ProcessPayoutJob{})
-	river.AddWorker(workers, &queue.ProcessWebhookJob{})
+	river.AddWorker(workers, &queue.ProcessPayoutJob{Service: payoutService})
+	river.AddWorker(workers, &queue.ProcessWebhookJob{Service: githubService})
+	river.AddWorker(workers, &queue.SendWebhookJob{Service: notifyService})
 	river.AddWorker(workers, &queue.ReconciliationJob{Service: ledgerService})
 	river.AddWorker(workers, &queue.ClaimExpiryJob{Service: bountyService})
 	river.AddWorker(workers, &queue.BountyExpiryJob{Service: bountyService})
