@@ -23,3 +23,7 @@ Wash bounties (maintainer pays own sockpuppet to farm reputation), spam PRs, cla
 
 ## Metrics
 Flag rate, false-positive rate, time to review, funds held.
+
+## Implementation notes (fraud controls v1)
+Implemented: frozen/banned enforcement, owner self-claim block, minimum GitHub account age (applies to all claims when enabled, default off), max active claims per contributor (default 3), reciprocal-pattern flags in reconciliation, per-project trailing-24h payout cap (default 1M sats).
+Not yet implemented: public-activity checks, new-contributor caps, manual review queue UI, payout address-change cooldown flow, rate limiting. These remain required before public launch.

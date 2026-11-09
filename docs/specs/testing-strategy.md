@@ -22,3 +22,6 @@ Success; no route; recipient offline; invoice expired; amount below recipient mi
 
 ## CI gates
 Lint, vet, unit and integration tests, `govulncheck`, secrets scan, OpenAPI validation, migration dry run. Lightning regtest suite runs nightly and on payout-code changes.
+
+## Outstanding: LND regtest harness
+`make test-ln` currently runs zero tests: `internal/lightning/` has no test files, and `docker-compose.yml` ships `bitcoind` + `lnd` images with no setup scripts (no mining, wallet init, peering, or channel-open automation). Before closed beta, add a harness that brings up a regtest network, funds and opens channels, and covers: deposit invoice settlement via `SubscribeInvoices`, successful `PayInvoice` with fee accounting, no-route and offline-recipient failures, invoice expiry, duplicate payment jobs, and an LND restart mid-payment proving payment-hash recovery. Until then, payout paths are covered only by Postgres integration tests with a stubbed Lightning service, and `funding_paused` / `outflows_paused` must stay on.

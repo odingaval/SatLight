@@ -36,3 +36,9 @@ A payout is released only when all are true:
 
 ## Rate limits
 Cache issue/PR reads; use conditional requests (ETag) and back off on `403/429` with `Retry-After`.
+
+## Implementation notes
+- Merge verification re-fetches the PR and the repository (for the default branch) from the API on every relevant delivery; the webhook payload is never trusted for money decisions.
+- The 10-minute force-revert grace window is enforced at payout time by re-verifying the merge just before sending, with no artificial delay (per the PRD's sub-30s payout goal).
+- Self-merges are flagged in the audit log (`pr.self_merge`) and recorded on the PR row; automatic payouts for self-merged PRs are held for manual release instead of being sent silently.
+- "Bounty paused" on issue close/repo transfer is not implemented: there is no paused state. Deleted issues with active bounties are flagged for staff review instead.
