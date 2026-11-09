@@ -73,8 +73,10 @@ paths:
       parameters: [ { $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       responses:
         '201': { description: Claim created, content: { application/json: { schema: { $ref: '#/components/schemas/Claim' } } } }
+        '200': { description: Existing claim returned for an idempotent retry, content: { application/json: { schema: { $ref: '#/components/schemas/Claim' } } } }
         '409': { description: Already claimed or not open, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '422': { description: Missing payout destination or ineligible }
+        '403': { description: Banned user, frozen project, or owner claiming own bounty }
+        '422': { description: Missing payout destination, too-new GitHub account, or ineligible }
     delete:
       summary: Release claim
       parameters: [ { $ref: '#/components/parameters/Id' } ]
@@ -89,13 +91,27 @@ paths:
         '409': { description: Not cancellable in current state }
   /bounties/{id}/dispute:
     post:
-      summary: Open a dispute
+      summary: Open a dispute (moves the bounty to disputed)
       parameters: [ { $ref: '#/components/parameters/Id' } ]
       requestBody:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/DisputeRequest' } } }
       responses:
         '201': { description: Dispute opened }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Bounty cannot be disputed in its current state }
+  /disputes/{id}/resolve:
+    post:
+      summary: Resolve a dispute (project owner only)
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/DisputeResolveRequest' } } }
+      responses:
+        '200': { description: Dispute resolved }
+        '403': { description: Only the project owner can resolve }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Already resolved, no longer disputed, or no verified merge for a payout resolution }
   /projects:
     post:
       summary: Register a project (maintainer with GitHub App installed)
@@ -140,8 +156,12 @@ paths:
         content: { application/json: { schema: { $ref: '#/components/schemas/BountyCreate' } } }
       responses:
         '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Bounty' } } } }
+        '200': { description: Existing bounty returned for an idempotent retry, content: { application/json: { schema: { $ref: '#/components/schemas/Bounty' } } } }
         '402': { description: Insufficient wallet balance }
         '400': { description: Invalid or expired bounty expiry timestamp }
+        '403': { description: Project is frozen }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Duplicate issue bounty, or idempotency key reused with different data }
   /me:
     get:
       summary: Current user
@@ -160,13 +180,41 @@ paths:
       summary: Payout history
       responses:
         '200': { description: Payouts, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Payout' } } } } }
+  /me/claims:
+    get:
+      summary: My claims with bounty details
+      responses:
+        '200': { description: Claims, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/MyClaim' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /payouts/claim/{token}:
     get:
       summary: Redeem a payout claim link (LNURL-withdraw)
       security: []
       parameters: [ { name: token, in: path, required: true, schema: { type: string } } ]
       responses:
-        '200': { description: LNURL-withdraw response }
+        '200': { description: LNURL-withdraw response with exact-amount bounds }
+        '404': { description: Unknown or already-used claim link }
+  /payouts/claim/callback:
+    get:
+      summary: LNURL-withdraw callback (called by the wallet with k1 and pr)
+      security: []
+      parameters:
+        - { name: k1, in: query, required: true, schema: { type: string } }
+        - { name: pr, in: query, required: true, schema: { type: string, description: Exact-amount BOLT11 invoice } }
+      responses:
+        '200': { description: '{status: OK} on success, {status: ERROR, reason} otherwise (link stays usable on payment failure)' }
+        '404': { description: Unknown or already-used claim link }
+  /projects/{id}/notifications:
+    put:
+      summary: Configure maintainer webhook notifications (project owner)
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProjectNotificationsRequest' } } }
+      responses:
+        '200': { description: Notification settings updated }
+        '400': { description: Invalid webhook URL }
+        '403': { description: Only the project owner can configure notifications }
   /webhooks/github:
     post:
       summary: GitHub webhook receiver
@@ -225,5 +273,8 @@ components:
         state: { $ref: '#/components/schemas/BountyState' }
         expires_at: { type: string, format: date-time }
     Claim: { type: object, properties: { id: { type: integer }, bounty_id: { type: integer }, status: { type: string }, expires_at: { type: string, format: date-time } } }
-    Payout: { type: object, properties: { id: { type: integer }, bounty_id: { type: integer }, amount_sats: { type: integer }, fee_sats: { type: integer }, status: { type: string }, settled_at: { type: string, format: date-time, nullable: true } } }
+    Payout: { type: object, properties: { id: { type: integer }, bounty_id: { type: integer }, amount_sats: { type: integer }, fee_sats: { type: integer }, status: { type: string }, settled_at: { type: string, format: date-time, nullable: true }, claim_link_token: { type: string, description: 'Present for claim_link_issued payouts so the owner can redeem' } } }
     DisputeRequest: { type: object, required: [reason], properties: { reason: { type: string }, evidence: { type: string } } }
+    DisputeResolveRequest: { type: object, required: [resolution], properties: { resolution: { type: string, enum: [resolved_pay, resolved_cancel, resolved_other] } } }
+    ProjectNotificationsRequest: { type: object, properties: { webhook_url: { type: string, description: 'HTTPS endpoint for claim/merge/payout events (empty clears)' }, webhook_secret: { type: string, description: 'HMAC signing secret for X-Satlight-Signature (empty clears)' } } }
+    MyClaim: { type: object, properties: { id: { type: integer }, bounty_id: { type: integer }, status: { type: string }, expires_at: { type: string, format: date-time }, title: { type: string }, reward_sats: { type: integer }, bounty_state: { type: string }, repo_full_name: { type: string } } }
