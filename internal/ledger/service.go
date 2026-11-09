@@ -16,13 +16,19 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+	"github.com/satlight/satlight/internal/metrics"
 )
 
 var (
-	ErrLedgerImbalance    = errors.New("ledger entries do not balance")
-	ErrInvalidLedgerEntry = errors.New("invalid ledger entry")
-	ErrTooFewEntries      = errors.New("at least two entries required")
+	ErrLedgerImbalance        = errors.New("ledger entries do not balance")
+	ErrInvalidLedgerEntry     = errors.New("invalid ledger entry")
+	ErrTooFewEntries          = errors.New("at least two entries required")
+	ErrDailyPayoutCapExceeded = errors.New("project daily payout cap exceeded")
 )
+
+// reciprocalFlagThreshold is the number of merged bounties between one owner
+// and one contributor that raises a collusion flag for manual review.
+const reciprocalFlagThreshold = 2
 
 type Service struct {
 	pool        *pgxpool.Pool
@@ -121,12 +127,18 @@ func (s *Service) RefundBountyFunds(ctx context.Context, tx pgx.Tx, projectID, b
 
 func (s *Service) ProcessPayout(ctx context.Context, tx pgx.Tx, projectID, bountyID, userID int64, rewardSats, feeSats, routingFeeSats int64) error {
 	netPayout := rewardSats - feeSats
-	return s.RecordTransaction(ctx, tx, []Entry{
+	entries := []Entry{
 		{Account: projectAccount(projectID, "reserved"), Direction: "debit", AmountSats: rewardSats, RefType: "payout", RefID: bountyID},
 		{Account: "user:" + strconv.FormatInt(userID, 10) + ":external", Direction: "credit", AmountSats: netPayout, RefType: "payout", RefID: bountyID},
 		{Account: "platform:fees", Direction: "credit", AmountSats: feeSats, RefType: "payout", RefID: bountyID},
-		{Account: "platform:routing_costs", Direction: "credit", AmountSats: routingFeeSats, RefType: "payout", RefID: bountyID},
-	})
+	}
+	if routingFeeSats > 0 {
+		entries = append(entries,
+			Entry{Account: "node:liquidity", Direction: "debit", AmountSats: routingFeeSats, RefType: "payout", RefID: bountyID},
+			Entry{Account: "platform:routing_costs", Direction: "credit", AmountSats: routingFeeSats, RefType: "payout", RefID: bountyID},
+		)
+	}
+	return s.RecordTransaction(ctx, tx, entries)
 }
 
 func (s *Service) CreditDeposit(ctx context.Context, tx pgx.Tx, projectID, depositID int64, amountSats int64) error {
@@ -146,7 +158,7 @@ func (s *Service) GetAccountBalance(ctx context.Context, account string) (int64,
 		SELECT COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount_sats ELSE -amount_sats END), 0)
 		FROM ledger_entries WHERE account = $1
 	`, account).Scan(&balance)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	return balance, err
@@ -160,11 +172,91 @@ type WalletMismatch struct {
 	ReservedLedger  int64 `json:"reserved_ledger_sats"`
 }
 
+// ReciprocalFlag describes an owner/contributor pair with repeat merged work.
+// Mutual is set when the pair funds each other in both directions.
+type ReciprocalFlag struct {
+	OwnerUserID       int64 `json:"owner_user_id"`
+	ContributorUserID int64 `json:"contributor_user_id"`
+	MergedBounties    int   `json:"merged_bounties"`
+	Mutual            bool  `json:"mutual"`
+}
+
+// DetectReciprocalPatterns finds owner/contributor pairs with unusually
+// frequent merged work. Flags are for manual review, never automatic action.
+func (s *Service) DetectReciprocalPatterns(ctx context.Context) ([]ReciprocalFlag, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT p.owner_user_id, c.user_id, COUNT(DISTINCT b.id)
+		FROM bounties b
+		JOIN claims c ON c.bounty_id = b.id
+		JOIN projects p ON b.project_id = p.id
+		JOIN pull_requests pr ON pr.claim_id = c.id AND pr.merged
+		WHERE b.state IN ('merged', 'paid')
+		GROUP BY 1, 2 HAVING COUNT(DISTINCT b.id) >= $1
+		ORDER BY 3 DESC
+	`, reciprocalFlagThreshold)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var flags []ReciprocalFlag
+	for rows.Next() {
+		var flag ReciprocalFlag
+		if err := rows.Scan(&flag.OwnerUserID, &flag.ContributorUserID, &flag.MergedBounties); err != nil {
+			return nil, err
+		}
+		flags = append(flags, flag)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	pairs := make(map[[2]int64]bool, len(flags))
+	for _, flag := range flags {
+		pairs[[2]int64{flag.OwnerUserID, flag.ContributorUserID}] = true
+	}
+	for i := range flags {
+		if pairs[[2]int64{flags[i].ContributorUserID, flags[i].OwnerUserID}] {
+			flags[i].Mutual = true
+		}
+	}
+	return flags, nil
+}
+
+// ProjectPaidLast24h totals settled payouts for a project over the trailing
+// 24 hours.
+func (s *Service) ProjectPaidLast24h(ctx context.Context, projectID int64) (int64, error) {
+	var total int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(p.amount_sats), 0) FROM payouts p
+		JOIN bounties b ON p.bounty_id = b.id
+		WHERE b.project_id = $1 AND p.status IN ('settled', 'claimed_via_link') AND p.settled_at > now() - interval '24 hours'
+	`, projectID).Scan(&total)
+	return total, err
+}
+
+// CheckProjectPayoutCap rejects a payout that would push a project over its
+// trailing-24h cap. A non-positive cap disables the check. The payout flow
+// calls this before sending.
+func (s *Service) CheckProjectPayoutCap(ctx context.Context, projectID, additionalSats, capSats int64) error {
+	if capSats <= 0 {
+		return nil
+	}
+	paid, err := s.ProjectPaidLast24h(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	if paid+additionalSats > capSats {
+		return ErrDailyPayoutCapExceeded
+	}
+	return nil
+}
+
 type ReconciliationReport struct {
 	CheckedAt        time.Time        `json:"checked_at"`
 	AccountBalances  map[string]int64 `json:"account_balances"`
 	WalletMismatches []WalletMismatch `json:"wallet_mismatches"`
 	UnbalancedTxIDs  []string         `json:"unbalanced_transaction_ids"`
+	FraudFlags       []ReciprocalFlag `json:"fraud_flags,omitempty"`
 	NodeBalanceSats  int64            `json:"node_balance_sats"`
 	LiabilitiesSats  int64            `json:"liabilities_sats"`
 	EquitySats       int64            `json:"equity_sats"`
@@ -172,6 +264,7 @@ type ReconciliationReport struct {
 	DriftSats        int64            `json:"drift_sats"`
 	Severity         string           `json:"severity"`
 	NodeBalanceError string           `json:"node_balance_error,omitempty"`
+	UnmatchedOpen    int              `json:"unmatched_open_receipts"`
 	Healthy          bool             `json:"healthy"`
 }
 
@@ -297,6 +390,20 @@ func (s *Service) Reconcile(ctx context.Context) (*ReconciliationReport, error) 
 			report.Severity = "ok"
 		}
 	}
+	if flags, err := s.DetectReciprocalPatterns(ctx); err != nil {
+		s.log.Warn().Err(err).Msg("reciprocal-pattern detection failed; continuing reconciliation")
+	} else if len(flags) > 0 {
+		report.FraudFlags = flags
+		s.log.Warn().Int("flagged_pairs", len(flags)).Msg("reciprocal payment patterns flagged for manual review")
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM unmatched_receipts WHERE status = 'open'`).Scan(&report.UnmatchedOpen); err != nil {
+		return nil, err
+	}
+	if report.UnmatchedOpen > 0 {
+		s.log.Warn().Int("open_receipts", report.UnmatchedOpen).Msg("unmatched Lightning receipts await staff review")
+	}
+	metrics.ReconciliationDrift.Set(float64(report.DriftSats))
+	metrics.ReconciliationRuns.WithLabelValues(report.Severity).Inc()
 	report.Healthy = len(report.WalletMismatches) == 0 && len(report.UnbalancedTxIDs) == 0 && (report.Severity == "ok" || report.Severity == "info")
 	return report, nil
 }
