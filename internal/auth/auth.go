@@ -147,14 +147,19 @@ func (s *Service) GetUserByID(ctx context.Context, userID int64) (int64, string,
 	return githubID, login, email, lightningAddress, nil
 }
 
-func (s *Service) UpsertUser(ctx context.Context, githubID int64, login, email string) (int64, error) {
+func (s *Service) UpsertUser(ctx context.Context, githubID int64, login, email string, githubCreatedAt time.Time) (int64, error) {
+	var createdAt any
+	if !githubCreatedAt.IsZero() {
+		createdAt = githubCreatedAt
+	}
 	var userID int64
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO users (github_id, github_login, email)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (github_id) DO UPDATE SET github_login = EXCLUDED.github_login, email = EXCLUDED.email
+		INSERT INTO users (github_id, github_login, email, github_created_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (github_id) DO UPDATE SET github_login = EXCLUDED.github_login, email = EXCLUDED.email,
+			github_created_at = COALESCE(EXCLUDED.github_created_at, users.github_created_at)
 		RETURNING id
-	`, githubID, login, email).Scan(&userID)
+	`, githubID, login, email, createdAt).Scan(&userID)
 	return userID, err
 }
 
