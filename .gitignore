@@ -9,7 +9,7 @@ dev/
 
 # Go build outputs
 bin/
-api
+/api
 *.exe
 *.test
 *.prof
