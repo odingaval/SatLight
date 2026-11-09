@@ -61,6 +61,18 @@ func TestGetOAuthURL(t *testing.T) {
 	}
 }
 
+func TestSplitRepoFullName(t *testing.T) {
+	owner, repo, ok := splitRepoFullName("octo/demo")
+	if !ok || owner != "octo" || repo != "demo" {
+		t.Fatalf("splitRepoFullName(octo/demo) = %q %q %t", owner, repo, ok)
+	}
+	for _, bad := range []string{"", "noseparator", "/repo", "owner/", "a/b/c"} {
+		if _, _, ok := splitRepoFullName(bad); ok {
+			t.Errorf("splitRepoFullName(%q) ok = true, want false", bad)
+		}
+	}
+}
+
 func TestExtractIssueNumber(t *testing.T) {
 	for _, test := range []struct {
 		name string
