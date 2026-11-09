@@ -167,6 +167,9 @@ func (s *Service) SubscribeInvoices(ctx context.Context, handler func(InvoiceUpd
 }
 
 func (s *Service) PayInvoice(ctx context.Context, invoice string, maxFeeSats int64) ([]byte, error) {
+	if s.lightningClient == nil || s.routerClient == nil {
+		return nil, ErrNodeUnhealthy
+	}
 	// Parse the invoice to get the amount and destination
 	payReq, err := s.lightningClient.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: invoice})
 	if err != nil {
@@ -209,12 +212,21 @@ func (s *Service) PayInvoice(ctx context.Context, invoice string, maxFeeSats int
 }
 
 func (s *Service) GetPaymentStatus(ctx context.Context, paymentHash []byte) (string, error) {
-	// Use router's TrackPaymentV2 to get payment status
+	status, _, err := s.GetPaymentResult(ctx, paymentHash)
+	return status, err
+}
+
+// GetPaymentResult returns the status and routing fee of a payment attempt.
+// Unknown hashes (never sent) return an error from the node.
+func (s *Service) GetPaymentResult(ctx context.Context, paymentHash []byte) (string, int64, error) {
+	if s.routerClient == nil {
+		return "", 0, ErrNodeUnhealthy
+	}
 	stream, err := s.routerClient.TrackPaymentV2(ctx, &routerrpc.TrackPaymentRequest{
 		PaymentHash: paymentHash,
 	})
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	for {
@@ -223,11 +235,11 @@ func (s *Service) GetPaymentStatus(ctx context.Context, paymentHash []byte) (str
 			break
 		}
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
-		return payment.Status.String(), nil
+		return payment.Status.String(), payment.FeeSat, nil
 	}
-	return "unknown", nil
+	return "unknown", 0, nil
 }
 
 func (s *Service) GetChannelBalance(ctx context.Context) (int64, error) {
@@ -266,6 +278,9 @@ func (s *Service) GetWalletBalance(ctx context.Context) (int64, error) {
 }
 
 func (s *Service) DecodePayReq(ctx context.Context, payReq string) (*lnrpc.PayReq, error) {
+	if s.lightningClient == nil {
+		return nil, ErrNodeUnhealthy
+	}
 	return s.lightningClient.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: payReq})
 }
 
