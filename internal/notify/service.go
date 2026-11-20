@@ -126,6 +126,21 @@ func (s *Service) NotifyMergeReverted(ctx context.Context, ownerID, bountyID int
 			bountyID))
 }
 
+func (s *Service) NotifySelfMergeHeld(ctx context.Context, ownerID, bountyID int64) error {
+	return s.Notify(ctx, "payout_self_merge_held", ownerID, "bounty", bountyID,
+		fmt.Sprintf("Payout held for bounty #%d: self-merge", bountyID),
+		fmt.Sprintf("Bounty #%d was merged by its own author, so the automatic payout was held for manual review.\n\nNo funds moved and no claim link was issued. Review the pull request before releasing payment.\n",
+			bountyID))
+}
+
+func (s *Service) NotifyDestinationConfirm(ctx context.Context, userID, requestID int64, address, token string) error {
+	link := strings.TrimRight(s.cfg.WebURL, "/") + "/settings/confirm?token=" + token
+	return s.Notify(ctx, "payout_destination_confirm", userID, "destination_change", requestID,
+		"Confirm your new payout destination",
+		fmt.Sprintf("You asked to receive payouts at %s.\n\nConfirm within 24 hours:\n%s\n\nIf this was not you, ignore this email and contact support immediately. Your current destination stays active until you confirm.\n",
+			address, link))
+}
+
 func (s *Service) NotifyDestinationChanged(ctx context.Context, userID int64) error {
 	return s.Notify(ctx, "payout_destination_changed", userID, "user", userID,
 		"Your payout destination changed",

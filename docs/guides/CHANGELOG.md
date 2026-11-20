@@ -35,3 +35,9 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 - `GET /me/claims` lists the signed-in contributor's active claims; the frontend gains `/my-work` (claims and payouts) and `/settings` (Lightning destination) pages.
 - API handler integration tests cover project authz, bounty idempotency/402/409 paths, claim/release, dispute resolve, webhook dedupe and signature rejection.
 - Documented the outstanding LND regtest harness in the testing strategy (`make test-ln` currently runs zero tests).
+
+### Security
+- LND router calls (payment sends, payment tracking) now use the payment macaroon on a separate connection; the invoice macaroon can no longer send funds.
+- LNURL-pay endpoints are fetched through an SSRF guard: https-only, no credentials, no private/link-local targets, redirect and DNS-rebinding protection.
+- Self-merged payouts are held for manual review with no claim link issued (previously auto-releasable via an emailed link). Manual release tooling is still to come.
+- Payout destination changes now require a valid Lightning address, a session signed in within the last 15 minutes, and email confirmation via `POST /me/payout-destination/confirm` (24-hour single-use links, 48-hour payout cooldown from confirmation).

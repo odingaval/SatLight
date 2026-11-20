@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -31,6 +32,7 @@ type Service struct {
 	lightningClient lnrpc.LightningClient
 	routerClient    routerrpc.RouterClient
 	conn            *grpc.ClientConn
+	routerConn      *grpc.ClientConn
 	log             zerolog.Logger
 }
 
@@ -59,56 +61,71 @@ func (s *Service) Connect(ctx context.Context) error {
 		return err
 	}
 
-	// Load invoice macaroon from file
-	invoiceMacBytes, err := os.ReadFile(s.cfg.InvoiceMacaroon)
+	// The invoice macaroon authorizes receive-side calls (invoices, balances,
+	// node info); the payment macaroon authorizes the router (payment sends and
+	// payment tracking). They travel on separate connections so a
+	// least-privilege invoice macaroon can never send funds.
+	invoiceCred, err := loadMacaroonCredential(s.cfg.InvoiceMacaroon)
+	if err != nil {
+		return fmt.Errorf("load invoice macaroon: %w", err)
+	}
+	paymentCred, err := loadMacaroonCredential(s.cfg.PaymentMacaroon)
+	if err != nil {
+		return fmt.Errorf("load payment macaroon: %w", err)
+	}
+
+	dial := func(cred credentials.PerRPCCredentials) (*grpc.ClientConn, error) {
+		opts := []grpc.DialOption{
+			grpc.WithTransportCredentials(tlsCreds),
+			grpc.WithPerRPCCredentials(cred),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(50 * 1024 * 1024)),
+		}
+		return grpc.NewClient(s.cfg.Host, opts...)
+	}
+
+	invoiceConn, err := dial(invoiceCred)
 	if err != nil {
 		return err
 	}
-	invoiceMac := &macaroon.Macaroon{}
-	if err := invoiceMac.UnmarshalBinary(invoiceMacBytes); err != nil {
-		return err
-	}
-	invoiceCred, err := macaroons.NewMacaroonCredential(invoiceMac)
+	routerConn, err := dial(paymentCred)
 	if err != nil {
+		_ = invoiceConn.Close()
 		return err
 	}
 
-	// Load payment macaroon from file
-	paymentMacBytes, err := os.ReadFile(s.cfg.PaymentMacaroon)
-	if err != nil {
-		return err
-	}
-	paymentMac := &macaroon.Macaroon{}
-	if err := paymentMac.UnmarshalBinary(paymentMacBytes); err != nil {
-		return err
-	}
-	// paymentCred is created but we use invoiceCred for the connection
-	// Payment macaroon is used via the router client which shares the connection
-	_, _ = macaroons.NewMacaroonCredential(paymentMac)
-
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(tlsCreds),
-		grpc.WithPerRPCCredentials(invoiceCred), // default to invoice cred
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(50 * 1024 * 1024)),
-	}
-
-	conn, err := grpc.DialContext(ctx, s.cfg.Host, opts...)
-	if err != nil {
-		return err
-	}
-
-	s.conn = conn
-	s.lightningClient = lnrpc.NewLightningClient(conn)
-	s.routerClient = routerrpc.NewRouterClient(conn)
+	s.conn = invoiceConn
+	s.routerConn = routerConn
+	s.lightningClient = lnrpc.NewLightningClient(invoiceConn)
+	s.routerClient = routerrpc.NewRouterClient(routerConn)
 	s.log.Info().Msg("Connected to LND")
 	return nil
 }
 
-func (s *Service) Close() error {
-	if s.conn != nil {
-		return s.conn.Close()
+// loadMacaroonCredential reads one serialized macaroon file for gRPC auth.
+func loadMacaroonCredential(path string) (credentials.PerRPCCredentials, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	mac := &macaroon.Macaroon{}
+	if err := mac.UnmarshalBinary(raw); err != nil {
+		return nil, err
+	}
+	return macaroons.NewMacaroonCredential(mac)
+}
+
+func (s *Service) Close() error {
+	var firstErr error
+	for _, conn := range []*grpc.ClientConn{s.conn, s.routerConn} {
+		if conn != nil {
+			if err := conn.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	s.conn, s.routerConn = nil, nil
+	s.lightningClient, s.routerClient = nil, nil
+	return firstErr
 }
 
 func (s *Service) Connected() bool {

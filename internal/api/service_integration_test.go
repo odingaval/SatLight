@@ -3,6 +3,7 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -11,13 +12,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
@@ -391,4 +395,203 @@ func TestIntegrationAPIWithdrawCallbackValidation(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("metrics = %d, want 200", recorder.Code)
 	}
+}
+
+func TestIntegrationAPIDestinationChangeConfirmFlow(t *testing.T) {
+	f := newAPIFixture(t)
+	ctx := context.Background()
+	userID := f.user(t, "old@example.test")
+	cookie := f.cookie(t, userID)
+
+	// Malformed addresses are rejected before any session or email work.
+	recorder := doRequest(t, f.router, "PUT", "/api/v1/me/payout-destination",
+		map[string]any{"lightning_address": "not-an-address"}, nil, cookie)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("malformed address = %d, want 400", recorder.Code)
+	}
+
+	// Stale sessions must sign in again.
+	staleToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, &auth.Claims{
+		UserID:   userID,
+		AuthTime: jwt.NewNumericDate(time.Now().Add(-time.Hour)),
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}).SignedString([]byte("test-session-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder = doRequest(t, f.router, "PUT", "/api/v1/me/payout-destination",
+		map[string]any{"lightning_address": "new@example.test"}, nil,
+		&http.Cookie{Name: "satlight_session", Value: staleToken})
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("stale session = %d, want 401", recorder.Code)
+	}
+	if code := decodeBody(t, recorder)["error"].(map[string]any)["code"]; code != "REAUTH_REQUIRED" {
+		t.Fatalf("stale session code = %v, want REAUTH_REQUIRED", code)
+	}
+
+	// Repeating the current address is a no-op success.
+	recorder = doRequest(t, f.router, "PUT", "/api/v1/me/payout-destination",
+		map[string]any{"lightning_address": "old@example.test"}, nil, cookie)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unchanged address = %d (%s), want 200", recorder.Code, recorder.Body.String())
+	}
+
+	// A new address stages a request and emails a confirmation link.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	bodies := make(chan string, 4)
+	serveFakeSMTP(t, listener, bodies)
+	smtpCfg := *f.cfg
+	smtpCfg.SMTPURL = "smtp://" + listener.Addr().String()
+	router := NewServer(&smtpCfg, f.pool).Router()
+
+	recorder = doRequest(t, router, "PUT", "/api/v1/me/payout-destination",
+		map[string]any{"lightning_address": "new@example.test"}, nil, cookie)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("stage change = %d (%s), want 202", recorder.Code, recorder.Body.String())
+	}
+	var current string
+	if err := f.pool.QueryRow(ctx, `SELECT lightning_address FROM users WHERE id = $1`, userID).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
+	if current != "old@example.test" {
+		t.Fatalf("address changed before confirm: %q", current)
+	}
+	var emailed string
+	select {
+	case emailed = <-bodies:
+	case <-time.After(10 * time.Second):
+		t.Fatal("confirmation email was not sent")
+	}
+	const marker = "/settings/confirm?token="
+	idx := strings.Index(emailed, marker)
+	if idx < 0 {
+		t.Fatalf("email has no confirm link:\n%s", emailed)
+	}
+	token := strings.Fields(emailed[idx+len(marker):])[0]
+
+	recorder = doRequest(t, f.router, "POST", "/api/v1/me/payout-destination/confirm",
+		map[string]any{"token": token}, nil)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated confirm = %d, want 401", recorder.Code)
+	}
+	recorder = doRequest(t, f.router, "POST", "/api/v1/me/payout-destination/confirm",
+		map[string]any{"token": "bogus-token"}, nil, cookie)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("bogus token = %d, want 400", recorder.Code)
+	}
+	recorder = doRequest(t, f.router, "POST", "/api/v1/me/payout-destination/confirm",
+		map[string]any{"token": token}, nil, cookie)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("confirm = %d (%s), want 200", recorder.Code, recorder.Body.String())
+	}
+	var changedAt time.Time
+	if err := f.pool.QueryRow(ctx, `SELECT lightning_address, payout_changed_at FROM users WHERE id = $1`, userID).Scan(&current, &changedAt); err != nil {
+		t.Fatal(err)
+	}
+	if current != "new@example.test" || time.Since(changedAt) > time.Minute {
+		t.Fatalf("after confirm: address=%q changed_at=%v", current, changedAt)
+	}
+	var audits int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE action = 'payout_destination.confirmed' AND subject = $1`,
+		fmt.Sprintf("user:%d", userID)).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 1 {
+		t.Fatalf("confirmation audits = %d, want 1", audits)
+	}
+	recorder = doRequest(t, f.router, "POST", "/api/v1/me/payout-destination/confirm",
+		map[string]any{"token": token}, nil, cookie)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("second confirm = %d, want 400", recorder.Code)
+	}
+
+	// Expired and foreign requests are rejected.
+	expiredSum := sha256.Sum256([]byte("expired-token"))
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO destination_change_requests (user_id, new_address, token_hash, expires_at)
+		VALUES ($1, 'expired@example.test', $2, now() - interval '1 hour')
+	`, userID, expiredSum[:]); err != nil {
+		t.Fatal(err)
+	}
+	recorder = doRequest(t, f.router, "POST", "/api/v1/me/payout-destination/confirm",
+		map[string]any{"token": "expired-token"}, nil, cookie)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expired token = %d, want 400", recorder.Code)
+	}
+	foreignSum := sha256.Sum256([]byte("foreign-token"))
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO destination_change_requests (user_id, new_address, token_hash, expires_at)
+		VALUES ($1, 'foreign@example.test', $2, now() + interval '1 hour')
+	`, f.ownerID, foreignSum[:]); err != nil {
+		t.Fatal(err)
+	}
+	recorder = doRequest(t, f.router, "POST", "/api/v1/me/payout-destination/confirm",
+		map[string]any{"token": "foreign-token"}, nil, cookie)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("foreign token = %d, want 400", recorder.Code)
+	}
+}
+
+// serveFakeSMTP accepts mail for tests and delivers message bodies to bodies.
+// It speaks just enough SMTP for net/smtp.SendMail without auth or TLS.
+func serveFakeSMTP(t *testing.T, listener net.Listener, bodies chan<- string) {
+	t.Helper()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				rw := bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c))
+				_, _ = rw.WriteString("220 satlight-test smtp\r\n")
+				_ = rw.Flush()
+				var data strings.Builder
+				inData := false
+				for {
+					line, err := rw.ReadString('\n')
+					if err != nil {
+						return
+					}
+					trimmed := strings.TrimRight(line, "\r\n")
+					if inData {
+						if trimmed == "." {
+							inData = false
+							_, _ = rw.WriteString("250 queued\r\n")
+							_ = rw.Flush()
+							select {
+							case bodies <- data.String():
+							default:
+							}
+							data.Reset()
+						} else {
+							data.WriteString(line)
+						}
+						continue
+					}
+					switch upper := strings.ToUpper(trimmed); {
+					case strings.HasPrefix(upper, "EHLO") || strings.HasPrefix(upper, "HELO"):
+						_, _ = rw.WriteString("250 hello\r\n")
+					case strings.HasPrefix(upper, "DATA"):
+						inData = true
+						_, _ = rw.WriteString("354 end with .\r\n")
+					case strings.HasPrefix(upper, "QUIT"):
+						_, _ = rw.WriteString("221 bye\r\n")
+						_ = rw.Flush()
+						return
+					default:
+						_, _ = rw.WriteString("250 ok\r\n")
+					}
+					_ = rw.Flush()
+				}
+			}(conn)
+		}
+	}()
 }

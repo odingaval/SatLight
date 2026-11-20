@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -69,11 +70,16 @@ type Service struct {
 	notify    *notify.Service
 	queue     *queue.Client
 	http      *http.Client
+	// allowPrivateLNURL relaxes the SSRF guard to scheme-only checks so
+	// integration tests can serve LNURL from httptest servers on loopback.
+	// It is set only by same-package tests; production code must never
+	// enable it.
+	allowPrivateLNURL bool
 }
 
 func NewService(cfg *config.Config, pool *pgxpool.Pool) *Service {
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}).With().Timestamp().Logger()
-	return &Service{cfg: cfg, pool: pool, log: logger, http: &http.Client{Timeout: 10 * time.Second}}
+	return &Service{cfg: cfg, pool: pool, log: logger, http: newSafeHTTPClient(10 * time.Second)}
 }
 
 func (s *Service) SetDependencies(ledger *ledger.Service, lightning LightningSender, github MergeVerifier, notify *notify.Service, queue *queue.Client) {
@@ -166,7 +172,9 @@ func (s *Service) maxRoutingFeeSats(amountSats int64) int64 {
 	return fee
 }
 
-func parseLightningAddress(address string) (user, domain string, err error) {
+// ParseLightningAddress splits a Lightning address into user and domain,
+// rejecting malformed values before they can reach resolution or storage.
+func ParseLightningAddress(address string) (user, domain string, err error) {
 	address = strings.TrimSpace(address)
 	parts := strings.Split(address, "@")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.ContainsAny(address, " \t\n/") {
@@ -178,7 +186,7 @@ func parseLightningAddress(address string) (user, domain string, err error) {
 // invoiceForDestination resolves a Lightning address via LNURL-pay and
 // returns a BOLT11 invoice for the exact amount with its payment hash.
 func (s *Service) invoiceForDestination(ctx context.Context, address string, amountSats int64) (string, []byte, error) {
-	user, domain, err := parseLightningAddress(address)
+	user, domain, err := ParseLightningAddress(address)
 	if err != nil {
 		return "", nil, err
 	}
@@ -188,7 +196,11 @@ func (s *Service) invoiceForDestination(ctx context.Context, address string, amo
 		MaxSendable int64  `json:"maxSendable"`
 		Tag         string `json:"tag"`
 	}
-	if err := s.getJSON(ctx, "https://"+domain+"/.well-known/lnurlp/"+user, &params); err != nil {
+	endpoint := "https://" + domain + "/.well-known/lnurlp/" + user
+	if err := s.validateLNURLTarget(endpoint); err != nil {
+		return "", nil, err
+	}
+	if err := s.getJSON(ctx, endpoint, &params); err != nil {
 		return "", nil, err
 	}
 	if params.Tag != "payRequest" || params.Callback == "" {
@@ -205,6 +217,12 @@ func (s *Service) invoiceForDestination(ctx context.Context, address string, amo
 	query := callbackURL.Query()
 	query.Set("amount", strconv.FormatInt(msats, 10))
 	callbackURL.RawQuery = query.Encode()
+	// The callback host is recipient-controlled: re-validate after building
+	// the final URL so a malicious LNURL server cannot redirect the payout
+	// worker at internal services (SSRF).
+	if err := s.validateLNURLTarget(callbackURL.String()); err != nil {
+		return "", nil, err
+	}
 	var invoiceResp struct {
 		PR string `json:"pr"`
 	}
@@ -229,6 +247,9 @@ func (s *Service) invoiceForDestination(ctx context.Context, address string, amo
 }
 
 func (s *Service) getJSON(ctx context.Context, rawURL string, v any) error {
+	if err := s.validateLNURLTarget(rawURL); err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
@@ -242,6 +263,98 @@ func (s *Service) getJSON(ctx context.Context, rawURL string, v any) error {
 		return fmt.Errorf("LNURL request failed: %s", resp.Status)
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(v)
+}
+
+// newSafeHTTPClient builds the client for recipient-controlled LNURL
+// endpoints. DNS is resolved at dial time and only public IPs are dialed, so
+// a malicious wallet domain cannot reach internal services even across
+// redirects or DNS rebinding.
+func newSafeHTTPClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: timeout}
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+				if err != nil {
+					return nil, err
+				}
+				var firstErr error
+				for _, ip := range ips {
+					if !isPublicIP(ip) {
+						continue
+					}
+					conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+					if err == nil {
+						return conn, nil
+					}
+					if firstErr == nil {
+						firstErr = err
+					}
+				}
+				if firstErr != nil {
+					return nil, firstErr
+				}
+				return nil, fmt.Errorf("refusing to connect to non-public address %q", host)
+			},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("too many redirects")
+			}
+			return validateOutboundURL(req.URL.String())
+		},
+	}
+}
+
+// validateLNURLTarget enforces the SSRF guard for recipient-controlled LNURL
+// endpoints. Tests serving LNURL from loopback set allowPrivateLNURL, which
+// keeps the https/credentials/host checks but skips the public-IP checks.
+func (s *Service) validateLNURLTarget(rawURL string) error {
+	return validateOutboundURLWithPolicy(rawURL, s.allowPrivateLNURL)
+}
+
+// validateOutboundURL allows only https URLs without credentials, and rejects
+// localhost and IP literals that are not publicly routable. Other hostnames
+// are checked again at dial time (see newSafeHTTPClient) to cover DNS
+// rebinding.
+func validateOutboundURL(rawURL string) error {
+	return validateOutboundURLWithPolicy(rawURL, false)
+}
+
+func validateOutboundURLWithPolicy(rawURL string, allowPrivate bool) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("refusing non-https URL %q", parsed.Redacted())
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("refusing URL with credentials %q", parsed.Redacted())
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return errors.New("refusing URL with empty host")
+	}
+	if allowPrivate {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return fmt.Errorf("refusing non-public host %q", host)
+	}
+	if ip := net.ParseIP(host); ip != nil && !isPublicIP(ip) {
+		return fmt.Errorf("refusing non-public IP literal %q", host)
+	}
+	return nil
+}
+
+func isPublicIP(ip net.IP) bool {
+	return ip != nil && ip.IsGlobalUnicast() && !ip.IsPrivate()
 }
 
 func newClaimToken() (string, error) {
@@ -317,7 +430,7 @@ func (s *Service) ProcessBountyPayout(ctx context.Context, bountyID int64) error
 		return s.holdForRevertedMerge(ctx, pctx)
 	}
 	if pctx.selfMerged {
-		return s.holdWithClaimLink(ctx, pctx, "self-merged pull request")
+		return s.holdSelfMerged(ctx, pctx)
 	}
 	if pctx.changedAt != nil && time.Since(*pctx.changedAt) < destinationCooldown {
 		return s.delayForCooldown(ctx, pctx)
@@ -517,21 +630,9 @@ func (s *Service) settlePayout(ctx context.Context, payoutID int64, paymentHash 
 }
 
 func (s *Service) holdForRevertedMerge(ctx context.Context, pctx *payoutContext) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
+	if err := s.recordManualHold(ctx, pctx, "merge could not be re-verified"); err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO audit_log (actor, action, subject, metadata)
-		VALUES ('system', 'payout.held', $1, '{"reason":"merge could not be re-verified"}')
-	`, "bounty:"+strconv.FormatInt(pctx.bountyID, 10)); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	metrics.PayoutsCompleted.WithLabelValues("held").Inc()
 	s.log.Error().Int64("bounty_id", pctx.bountyID).Msg("merge re-verification failed; payout held for manual review")
 	if err := s.notify.NotifyMergeReverted(ctx, pctx.ownerID, pctx.bountyID); err != nil {
 		s.log.Error().Err(err).Msg("failed to send merge-reverted notification")
@@ -539,32 +640,28 @@ func (s *Service) holdForRevertedMerge(ctx context.Context, pctx *payoutContext)
 	return nil
 }
 
-func (s *Service) holdWithClaimLink(ctx context.Context, pctx *payoutContext, reason string) error {
-	token, err := newClaimToken()
-	if err != nil {
+// holdSelfMerged parks a self-merged payout for manual review. Unlike failure
+// recovery it issues no claim link: the claimant merged their own work, so no
+// funds may move until staff release them.
+func (s *Service) holdSelfMerged(ctx context.Context, pctx *payoutContext) error {
+	if err := s.recordManualHold(ctx, pctx, "self-merged pull request"); err != nil {
 		return err
 	}
+	s.log.Warn().Int64("bounty_id", pctx.bountyID).Msg("self-merged payout held for manual review; no claim link issued")
+	if err := s.notify.NotifySelfMergeHeld(ctx, pctx.ownerID, pctx.bountyID); err != nil {
+		s.log.Error().Err(err).Msg("failed to send self-merge-held notification")
+	}
+	return nil
+}
+
+// recordManualHold audits a held payout. It touches no payout rows: the hold
+// is terminal for this job run and only a manual release may move funds.
+func (s *Service) recordManualHold(ctx context.Context, pctx *payoutContext, reason string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	var payoutID int64
-	err = tx.QueryRow(ctx, `SELECT id FROM payouts WHERE bounty_id = $1 FOR UPDATE`, pctx.bountyID).Scan(&payoutID)
-	if errors.Is(err, sql.ErrNoRows) {
-		err = tx.QueryRow(ctx, `
-			INSERT INTO payouts (bounty_id, user_id, amount_sats, fee_sats, destination, status, claim_link_token, last_error)
-			VALUES ($1, $2, $3, $4, $5, 'claim_link_issued', $6, $7) RETURNING id
-		`, pctx.bountyID, pctx.userID, pctx.rewardSats-pctx.feeSats, pctx.feeSats, pctx.destination, token, "held: "+reason).Scan(&payoutID)
-		if err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	} else if _, err := tx.Exec(ctx, `UPDATE payouts SET status = 'claim_link_issued', claim_link_token = $1, last_error = $2 WHERE id = $3`,
-		token, "held: "+reason, payoutID); err != nil {
-		return err
-	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO audit_log (actor, action, subject, metadata)
 		VALUES ('system', 'payout.held', $1, $2::jsonb)
@@ -574,11 +671,7 @@ func (s *Service) holdWithClaimLink(ctx context.Context, pctx *payoutContext, re
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	metrics.PayoutsCompleted.WithLabelValues("claim_link_issued").Inc()
-	s.log.Warn().Int64("bounty_id", pctx.bountyID).Str("reason", reason).Msg("automatic payout held; claim link issued")
-	if err := s.notify.NotifyClaimLink(ctx, pctx.userID, payoutID, token, pctx.rewardSats-pctx.feeSats); err != nil {
-		s.log.Error().Err(err).Msg("failed to send claim-link notification")
-	}
+	metrics.PayoutsCompleted.WithLabelValues("held").Inc()
 	return nil
 }
 

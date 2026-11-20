@@ -169,12 +169,25 @@ paths:
         '200': { description: User, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
   /me/payout-destination:
     put:
-      summary: Set Lightning address
+      summary: Stage a Lightning address change (requires fresh sign-in; email confirmation)
       requestBody:
         required: true
         content: { application/json: { schema: { type: object, required: [lightning_address], properties: { lightning_address: { type: string, example: you@wallet.example } } } } }
       responses:
-        '200': { description: Updated (may require email confirmation and cooldown) }
+        '202': { description: Confirmation email sent; nothing changes until confirmed }
+        '200': { description: Destination unchanged (same address) }
+        '400': { description: Invalid Lightning address }
+        '401': { description: Unauthorized, or REAUTH_REQUIRED when the session is older than 15 minutes }
+        '500': { description: Confirmation email could not be sent }
+  /me/payout-destination/confirm:
+    post:
+      summary: Confirm a staged Lightning address change
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [token], properties: { token: { type: string } } } } }
+      responses:
+        '200': { description: Destination updated; 48-hour payout cooldown restarted }
+        '400': { description: Invalid or expired confirmation link }
   /me/payouts:
     get:
       summary: Payout history

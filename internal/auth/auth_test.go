@@ -33,6 +33,9 @@ func TestGenerateAndValidateToken(t *testing.T) {
 	if claims.ExpiresAt == nil || claims.ExpiresAt.Time.Before(time.Now()) {
 		t.Fatalf("token expiration is missing or already expired: %#v", claims.ExpiresAt)
 	}
+	if claims.AuthTime == nil || time.Since(claims.AuthTime.Time) > time.Minute {
+		t.Fatalf("token auth time is missing or stale: %#v", claims.AuthTime)
+	}
 }
 
 func TestValidateTokenRejectsInvalidTokens(t *testing.T) {
@@ -165,6 +168,66 @@ func TestVerifyGitHubSignature(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := VerifyGitHubSignature(test.payload, test.signature, secret); got != test.want {
 				t.Fatalf("VerifyGitHubSignature() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRequireFreshSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &Service{cfg: &config.Config{SessionSecret: "fresh-session-secret"}}
+	freshToken, err := service.GenerateToken(11)
+	if err != nil {
+		t.Fatalf("GenerateToken() error = %v", err)
+	}
+	sign := func(claims *Claims) string {
+		token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte("fresh-session-secret"))
+		if err != nil {
+			t.Fatalf("SignedString() error = %v", err)
+		}
+		return token
+	}
+	staleToken := sign(&Claims{
+		UserID:   11,
+		AuthTime: jwt.NewNumericDate(time.Now().Add(-time.Hour)),
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	})
+	legacyToken := sign(&Claims{
+		UserID: 11,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	})
+
+	for _, test := range []struct {
+		name       string
+		cookie     string
+		wantStatus int
+	}{
+		{name: "missing cookie", wantStatus: http.StatusUnauthorized},
+		{name: "fresh session", cookie: freshToken, wantStatus: http.StatusNoContent},
+		{name: "stale session", cookie: staleToken, wantStatus: http.StatusUnauthorized},
+		{name: "legacy session without auth time", cookie: legacyToken, wantStatus: http.StatusUnauthorized},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router := gin.New()
+			router.GET("/sensitive", func(c *gin.Context) {
+				if _, ok := service.RequireFreshSession(c, FreshSessionMaxAge); !ok {
+					c.Status(http.StatusUnauthorized)
+					return
+				}
+				c.Status(http.StatusNoContent)
+			})
+			request := httptest.NewRequest(http.MethodGet, "/sensitive", nil)
+			if test.cookie != "" {
+				request.AddCookie(&http.Cookie{Name: "satlight_session", Value: test.cookie})
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, test.wantStatus)
 			}
 		})
 	}

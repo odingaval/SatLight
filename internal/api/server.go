@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
@@ -211,6 +213,7 @@ func (s *Server) setupRoutes() {
 
 		v1.GET("/me", s.authRequired(), s.handleGetMe)
 		v1.PUT("/me/payout-destination", s.authRequired(), s.handleSetPayoutDestination)
+		v1.POST("/me/payout-destination/confirm", s.authRequired(), s.handleConfirmPayoutDestination)
 		v1.GET("/me/payouts", s.authRequired(), s.handleGetPayouts)
 		v1.GET("/me/claims", s.authRequired(), s.handleGetMyClaims)
 
@@ -980,20 +983,143 @@ func (s *Server) handleSetPayoutDestination(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": err.Error()}})
 		return
 	}
-
-	_, err := s.pool.Exec(c.Request.Context(), `
-		UPDATE users SET lightning_address = $1, payout_changed_at = now() WHERE id = $2
-	`, req.LightningAddress, userID)
-	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to update payout destination")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to update payout destination"}})
+	address := strings.TrimSpace(req.LightningAddress)
+	if _, _, err := payout.ParseLightningAddress(address); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_DESTINATION", "message": "lightning address must look like you@wallet.example"}})
 		return
 	}
-	if err := s.services.Notify.NotifyDestinationChanged(c.Request.Context(), userID); err != nil {
+	if _, fresh := s.services.Auth.RequireFreshSession(c, auth.FreshSessionMaxAge); !fresh {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "REAUTH_REQUIRED", "message": "sign in again to change your payout destination"}})
+		return
+	}
+
+	ctx := c.Request.Context()
+	var current *string
+	if err := s.pool.QueryRow(ctx, `SELECT lightning_address FROM users WHERE id = $1`, userID).Scan(&current); err != nil {
+		s.logger.Error().Err(err).Msg("failed to load payout destination")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to load payout destination"}})
+		return
+	}
+	if current != nil && *current == address {
+		c.JSON(http.StatusOK, gin.H{"message": "payout destination unchanged"})
+		return
+	}
+
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		s.logger.Error().Err(err).Msg("failed to create confirmation token")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not start destination change"}})
+		return
+	}
+	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
+	sum := sha256.Sum256([]byte(token))
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to begin destination change")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not start destination change"}})
+		return
+	}
+	defer tx.Rollback(ctx)
+	// A new request supersedes older pending ones; their links stop working.
+	if _, err := tx.Exec(ctx, `DELETE FROM destination_change_requests WHERE user_id = $1 AND confirmed_at IS NULL`, userID); err != nil {
+		s.logger.Error().Err(err).Msg("failed to supersede destination change requests")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not start destination change"}})
+		return
+	}
+	var requestID int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO destination_change_requests (user_id, new_address, token_hash, expires_at)
+		VALUES ($1, $2, $3, now() + interval '24 hours') RETURNING id
+	`, userID, address, sum[:]).Scan(&requestID); err != nil {
+		s.logger.Error().Err(err).Msg("failed to store destination change request")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not start destination change"}})
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		s.logger.Error().Err(err).Msg("failed to commit destination change request")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not start destination change"}})
+		return
+	}
+	if err := s.services.Notify.NotifyDestinationConfirm(ctx, userID, requestID, address, token); err != nil {
+		s.logger.Error().Err(err).Msg("failed to send destination-confirmation email")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "EMAIL_FAILED", "message": "could not send the confirmation email; please try again"}})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{"message": "confirmation email sent; your destination changes after you confirm"})
+}
+
+func (s *Server) handleConfirmPayoutDestination(c *gin.Context) {
+	userID, ok := auth.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "unauthorized"}})
+		return
+	}
+
+	var req struct {
+		Token string `json:"token" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": err.Error()}})
+		return
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(req.Token)))
+
+	ctx := c.Request.Context()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to begin destination confirmation")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not confirm destination"}})
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	var requestID int64
+	var newAddress string
+	err = tx.QueryRow(ctx, `
+		SELECT id, new_address FROM destination_change_requests
+		WHERE user_id = $1 AND token_hash = $2 AND confirmed_at IS NULL AND expires_at > now()
+		FOR UPDATE
+	`, userID, sum[:]).Scan(&requestID, &newAddress)
+	if errors.Is(err, pgx.ErrNoRows) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_OR_EXPIRED", "message": "confirmation link is invalid or expired"}})
+		return
+	}
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to load destination change request")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not confirm destination"}})
+		return
+	}
+	if _, err := tx.Exec(ctx, `UPDATE users SET lightning_address = $1, payout_changed_at = now() WHERE id = $2`, newAddress, userID); err != nil {
+		s.logger.Error().Err(err).Msg("failed to update payout destination")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not confirm destination"}})
+		return
+	}
+	if _, err := tx.Exec(ctx, `UPDATE destination_change_requests SET confirmed_at = now() WHERE id = $1`, requestID); err != nil {
+		s.logger.Error().Err(err).Msg("failed to mark destination change confirmed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not confirm destination"}})
+		return
+	}
+	subject := "user:" + strconv.FormatInt(userID, 10)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_log (actor, action, subject, metadata)
+		VALUES ($1, 'payout_destination.confirmed', $2, $3::jsonb)
+	`, subject, subject, fmt.Sprintf(`{"request_id":%d}`, requestID)); err != nil {
+		s.logger.Error().Err(err).Msg("failed to audit destination confirmation")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not confirm destination"}})
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		s.logger.Error().Err(err).Msg("failed to commit destination confirmation")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not confirm destination"}})
+		return
+	}
+	if err := s.services.Notify.NotifyDestinationChanged(ctx, userID); err != nil {
 		s.logger.Error().Err(err).Msg("failed to send destination-change notification")
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "payout destination updated"})
+	c.JSON(http.StatusOK, gin.H{"message": "payout destination updated; automatic payouts resume after the 48-hour cooldown"})
 }
 
 func (s *Server) handleGetPayouts(c *gin.Context) {

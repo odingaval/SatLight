@@ -21,6 +21,7 @@ export function renderExtraPage(app: HTMLDivElement, path: string) {
   if (dashboardPath) { void renderDashboard(app, dashboardPath[1]); return true }
   if (path === '/my-work') { void renderMyWork(app); return true }
   if (path === '/settings') { void renderSettings(app); return true }
+  if (path === '/settings/confirm') { void renderConfirmDestination(app); return true }
   return false
 }
 
@@ -186,7 +187,7 @@ async function renderSettings(app: HTMLDivElement) {
     if (response.status === 401) { target.innerHTML = '<p>Sign in to manage your settings.</p><a class="btn btn-dark" href="/api/v1/auth/github">Continue with GitHub ↗</a>'; return }
     if (!response.ok) throw new Error('Could not load your settings.')
     const me = await response.json() as Me
-    target.innerHTML = `<p class="signed-in-as">Signed in as <strong>@${escapeHtml(me.github_login)}</strong></p><form id="destination-form"><label class="form-label" for="lightning-address">Lightning address</label><input class="form-input" id="lightning-address" name="lightning_address" placeholder="you@wallet.example" value="${escapeHtml(me.lightning_address ?? '')}" required><p class="register-hint">Payouts are sent here automatically on merge. New or changed destinations wait 48 hours before automatic payouts resume.</p><button class="btn btn-primary" type="submit">Save payout destination</button><p class="register-message" id="destination-message" role="status" aria-live="polite"></p></form>`
+    target.innerHTML = `<p class="signed-in-as">Signed in as <strong>@${escapeHtml(me.github_login)}</strong></p><form id="destination-form"><label class="form-label" for="lightning-address">Lightning address</label><input class="form-input" id="lightning-address" name="lightning_address" placeholder="you@wallet.example" value="${escapeHtml(me.lightning_address ?? '')}" required><p class="register-hint">Payouts are sent here automatically on merge. Changes need email confirmation, and new destinations wait 48 hours before automatic payouts resume.</p><button class="btn btn-primary" type="submit">Save payout destination</button><p class="register-message" id="destination-message" role="status" aria-live="polite"></p></form>`
     const form = target.querySelector<HTMLFormElement>('#destination-form')!
     const message = target.querySelector<HTMLParagraphElement>('#destination-message')!
     form.addEventListener('submit', async (event) => {
@@ -195,9 +196,16 @@ async function renderSettings(app: HTMLDivElement) {
       button.disabled = true; message.textContent = 'Saving…'; message.className = 'register-message'
       try {
         const result = await fetch('/api/v1/me/payout-destination', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lightning_address: String(new FormData(form).get('lightning_address')).trim() }) })
-        const data = await result.json().catch(() => ({})) as { error?: { message?: string } }
+        const data = await result.json().catch(() => ({})) as { error?: { code?: string; message?: string } }
+        if (result.status === 401 && data.error?.code === 'REAUTH_REQUIRED') {
+          message.innerHTML = 'For your security, <a href="/api/v1/auth/github">sign in again</a> to change your payout destination.'
+          message.className = 'register-message is-error'
+          return
+        }
         if (!result.ok) throw new Error(data.error?.message ?? 'Could not save your payout destination.')
-        message.textContent = 'Saved. If this is a new destination, automatic payouts resume after 48 hours.'
+        message.textContent = result.status === 202
+          ? 'Check your email to confirm the new destination. It activates after confirmation, with a 48-hour cooldown before automatic payouts resume.'
+          : 'Saved. If this is a new destination, automatic payouts resume after 48 hours.'
         message.className = 'register-message is-success'
       } catch (error) {
         message.textContent = error instanceof Error ? error.message : 'Could not save.'
@@ -205,4 +213,20 @@ async function renderSettings(app: HTMLDivElement) {
       } finally { button.disabled = false }
     })
   } catch (error) { target.innerHTML = `<p class="market-state is-error">${escapeHtml(error instanceof Error ? error.message : 'Could not load settings.')}</p>` }
+}
+
+async function renderConfirmDestination(app: HTMLDivElement) {
+  app.innerHTML = `${header}<main class="container detail-page"><h1>Confirm payout destination</h1><div id="confirm-body" class="market-state">Confirming…</div></main>`
+  const target = document.querySelector<HTMLDivElement>('#confirm-body')!
+  const token = new URLSearchParams(window.location.search).get('token') ?? ''
+  if (!token) { target.innerHTML = '<p>This confirmation link is missing its token. Request a new change from <a href="/settings">Settings</a>.</p>'; return }
+  try {
+    const result = await fetch('/api/v1/me/payout-destination/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
+    const data = await result.json().catch(() => ({})) as { error?: { message?: string } }
+    if (result.status === 401) { target.innerHTML = '<p>Sign in to confirm this change.</p><a class="btn btn-dark" href="/api/v1/auth/github">Continue with GitHub ↗</a>'; return }
+    if (!result.ok) throw new Error(data.error?.message ?? 'This link is invalid or expired. Request a new change from Settings.')
+    target.innerHTML = '<p>Your payout destination is updated. Automatic payouts resume after the 48-hour cooldown.</p><a class="btn btn-dark" href="/settings">Back to settings</a>'
+  } catch (error) {
+    target.innerHTML = `<p class="market-state is-error">${escapeHtml(error instanceof Error ? error.message : 'Could not confirm.')}</p>`
+  }
 }

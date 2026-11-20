@@ -31,8 +31,15 @@ type Service struct {
 
 type Claims struct {
 	UserID int64 `json:"user_id"`
+	// AuthTime is when the session was created (sign-in). Sensitive account
+	// changes require a recent AuthTime; see RequireFreshSession.
+	AuthTime *jwt.NumericDate `json:"auth_time,omitempty"`
 	jwt.RegisteredClaims
 }
+
+// FreshSessionMaxAge bounds how long after sign-in a session may perform
+// sensitive account changes without re-authenticating.
+const FreshSessionMaxAge = 15 * time.Minute
 
 func NewService(cfg *config.Config, pool *pgxpool.Pool) *Service {
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: gin.DefaultWriter, TimeFormat: zerolog.TimeFormatUnix}).With().Timestamp().Logger()
@@ -83,15 +90,35 @@ func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 }
 
 func (s *Service) GenerateToken(userID int64) (string, error) {
+	now := time.Now()
 	claims := &Claims{
-		UserID: userID,
+		UserID:   userID,
+		AuthTime: jwt.NewNumericDate(now),
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(30 * 24 * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(now.Add(30 * 24 * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(now),
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.cfg.SessionSecret))
+}
+
+// RequireFreshSession re-validates the request session and reports whether it
+// was created within maxAge. Sessions without an auth time (issued before
+// this check existed) are treated as stale: the user must sign in again.
+func (s *Service) RequireFreshSession(c *gin.Context, maxAge time.Duration) (*Claims, bool) {
+	sessionCookie, err := c.Cookie("satlight_session")
+	if err != nil {
+		return nil, false
+	}
+	claims, err := s.ValidateToken(sessionCookie)
+	if err != nil {
+		return nil, false
+	}
+	if claims.AuthTime == nil || time.Since(claims.AuthTime.Time) > maxAge {
+		return nil, false
+	}
+	return claims, true
 }
 
 func (s *Service) SetSessionCookie(c *gin.Context, token string) {

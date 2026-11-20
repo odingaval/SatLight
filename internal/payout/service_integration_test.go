@@ -191,6 +191,9 @@ func (f *payoutFixture) useMockLNURL(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	f.service.http = server.Client()
+	// The mock server listens on loopback, which the production SSRF guard
+	// refuses; relax only the public-IP checks for this fixture.
+	f.service.allowPrivateLNURL = true
 	domain := strings.TrimPrefix(server.URL, "https://")
 	if _, err := f.pool.Exec(context.Background(), `UPDATE users SET lightning_address = $1 WHERE id = $2`,
 		"contrib@"+domain, f.contribID); err != nil {
@@ -367,7 +370,7 @@ func TestIntegrationPayoutFailuresBackOffThenClaimLink(t *testing.T) {
 	}
 }
 
-func TestIntegrationPayoutHoldsSelfMergeWithClaimLink(t *testing.T) {
+func TestIntegrationPayoutHoldsSelfMergeWithoutClaimLink(t *testing.T) {
 	f := newPayoutFixture(t)
 	ctx := context.Background()
 	if _, err := f.pool.Exec(ctx, `
@@ -383,9 +386,33 @@ func TestIntegrationPayoutHoldsSelfMergeWithClaimLink(t *testing.T) {
 	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
 		t.Fatal(err)
 	}
-	status, _, token := f.payoutRow(t)
-	if status != "claim_link_issued" || token == nil {
-		t.Fatalf("self-merge: status=%q token set=%t, want claim_link_issued", status, token != nil)
+	var payouts int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM payouts WHERE bounty_id = $1`, f.bountyID).Scan(&payouts); err != nil {
+		t.Fatal(err)
+	}
+	if payouts != 0 {
+		t.Fatalf("payouts created = %d, want 0 for held self-merge", payouts)
+	}
+	var held int
+	if err := f.pool.QueryRow(ctx, `
+		SELECT count(*) FROM audit_log
+		WHERE action = 'payout.held' AND subject = $1 AND metadata->>'reason' = 'self-merged pull request'
+	`, "bounty:"+fmt.Sprint(f.bountyID)).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held != 1 {
+		t.Fatalf("payout.held audit entries = %d, want 1", held)
+	}
+	var notifications int
+	if err := f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM notifications WHERE kind = 'payout_self_merge_held' AND ref_id = $1`, f.bountyID).Scan(&notifications); err != nil {
+		t.Fatal(err)
+	}
+	if notifications != 1 {
+		t.Fatalf("payout_self_merge_held notifications = %d, want 1", notifications)
+	}
+	if state := f.bountyState(t); state != "merged" {
+		t.Fatalf("bounty state = %q, want merged (funds still reserved)", state)
 	}
 }
 
@@ -463,25 +490,23 @@ func TestIntegrationPayoutDelaysFreshDestination(t *testing.T) {
 func TestIntegrationClaimLinkWithdrawFlow(t *testing.T) {
 	f := newPayoutFixture(t)
 	ctx := context.Background()
-	if _, err := f.pool.Exec(ctx, `
-		UPDATE pull_requests SET merged_by_github_id = author_github_id
-		WHERE claim_id = (SELECT id FROM claims WHERE bounty_id = $1)
-	`, f.bountyID); err != nil {
-		t.Fatal(err)
-	}
-	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) {
-		t.Fatal("self-merge must not auto-pay")
-		return nil, nil
-	}
-	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
-		t.Fatal(err)
-	}
-	_, _, token := f.payoutRow(t)
-	req, err := f.service.GetWithdrawRequest(ctx, *token)
+	// Mint the claim link directly: self-merges no longer issue links, so the
+	// withdraw flow seeds the payout row a final send failure would create.
+	token, err := newClaimToken()
 	if err != nil {
 		t.Fatal(err)
 	}
 	netAmount := f.rewardSats - f.feeSats
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO payouts (bounty_id, user_id, amount_sats, fee_sats, destination, status, attempts, claim_link_token)
+		VALUES ($1, $2, $3, $4, 'contrib@example.test', 'claim_link_issued', 5, $5)
+	`, f.bountyID, f.contribID, netAmount, f.feeSats, token); err != nil {
+		t.Fatal(err)
+	}
+	req, err := f.service.GetWithdrawRequest(ctx, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if req.MinWithdrawableMs != netAmount*1000 || req.MaxWithdrawableMs != netAmount*1000 {
 		t.Fatalf("withdraw bounds = %d/%d msats, want %d", req.MinWithdrawableMs, req.MaxWithdrawableMs, netAmount*1000)
 	}
@@ -497,12 +522,12 @@ func TestIntegrationClaimLinkWithdrawFlow(t *testing.T) {
 		}
 		return &lnrpc.PayReq{NumSatoshis: netAmount, PaymentHash: hex.EncodeToString(sentHash)}, nil
 	}
-	if err := f.service.RedeemClaimLink(ctx, *token, "lnbc_wrong_amount"); !errors.Is(err, ErrInvoiceAmountMismatch) {
+	if err := f.service.RedeemClaimLink(ctx, token, "lnbc_wrong_amount"); !errors.Is(err, ErrInvoiceAmountMismatch) {
 		t.Fatalf("wrong-amount invoice: err=%v, want ErrInvoiceAmountMismatch", err)
 	}
 	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) { return sentHash, nil }
 	f.lightning.trackFunc = func(hash []byte) (string, int64, error) { return "SUCCEEDED", 1, nil }
-	if err := f.service.RedeemClaimLink(ctx, *token, "lnbc_correct"); err != nil {
+	if err := f.service.RedeemClaimLink(ctx, token, "lnbc_correct"); err != nil {
 		t.Fatal(err)
 	}
 	if status, _, _ := f.payoutRow(t); status != "claimed_via_link" {
@@ -511,7 +536,7 @@ func TestIntegrationClaimLinkWithdrawFlow(t *testing.T) {
 	if state := f.bountyState(t); state != "paid" {
 		t.Fatalf("bounty state = %q, want paid", state)
 	}
-	if err := f.service.RedeemClaimLink(ctx, *token, "lnbc_correct"); !errors.Is(err, ErrClaimLinkUsed) {
+	if err := f.service.RedeemClaimLink(ctx, token, "lnbc_correct"); !errors.Is(err, ErrClaimLinkUsed) {
 		t.Fatalf("second redemption: err=%v, want ErrClaimLinkUsed", err)
 	}
 	if calls != 3 {
