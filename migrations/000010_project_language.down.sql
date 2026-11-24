@@ -1,0 +1,5 @@
+BEGIN;
+
+ALTER TABLE projects DROP COLUMN IF EXISTS language;
+
+COMMIT;
