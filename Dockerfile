@@ -40,7 +40,6 @@ COPY --from=builder /satlight-migrate /app/satlight-migrate
 COPY --from=builder /app/migrations /app/migrations
 COPY --from=builder /app/.env.example /app/.env.example
 
-ENV HTTP_ADDR=:8080
 ENV APP_ENV=production
 
 EXPOSE 8080

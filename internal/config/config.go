@@ -124,6 +124,12 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// Hosts like Render assign the port at runtime via PORT and
+	// health-check it; an explicit HTTP_ADDR still wins when set.
+	if port := os.Getenv("PORT"); port != "" && os.Getenv("HTTP_ADDR") == "" {
+		cfg.HTTPAddr = ":" + port
+	}
+
 	if cfg.DatabaseURL == "" {
 		return nil, ErrMissingConfig("DATABASE_URL")
 	}
