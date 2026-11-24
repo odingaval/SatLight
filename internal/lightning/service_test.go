@@ -2,10 +2,17 @@ package lightning
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gopkg.in/macaroon.v2"
 )
 
@@ -46,5 +53,115 @@ func TestConnectFailsFastWithoutTLS(t *testing.T) {
 	svc := &Service{cfg: &Config{TLSCertPath: filepath.Join(t.TempDir(), "no-cert.pem")}}
 	if err := svc.Connect(context.Background()); err == nil {
 		t.Error("Connect() with missing TLS cert = nil, want error")
+	}
+}
+
+// fakeRouter scripts TrackPaymentV2 streams; the embedded nil interface keeps
+// the fake small since only TrackPaymentV2 is exercised.
+type fakeRouter struct {
+	routerrpc.RouterClient
+	dialErr error
+	stream  *fakeTrackStream
+	gotReq  *routerrpc.TrackPaymentRequest
+}
+
+func (f *fakeRouter) TrackPaymentV2(ctx context.Context, in *routerrpc.TrackPaymentRequest, _ ...grpc.CallOption) (routerrpc.Router_TrackPaymentV2Client, error) {
+	f.gotReq = in
+	if f.dialErr != nil {
+		return nil, f.dialErr
+	}
+	f.stream.ctx = ctx
+	return f.stream, nil
+}
+
+type fakeTrackStream struct {
+	grpc.ClientStream
+	ctx    context.Context
+	msgs   []*lnrpc.Payment
+	block  bool // block until ctx ends instead of serving msgs
+	served int
+}
+
+func (f *fakeTrackStream) Recv() (*lnrpc.Payment, error) {
+	if f.block {
+		<-f.ctx.Done()
+		return nil, f.ctx.Err()
+	}
+	if f.served >= len(f.msgs) {
+		return nil, io.EOF
+	}
+	msg := f.msgs[f.served]
+	f.served++
+	return msg, nil
+}
+
+func paymentMsg(status lnrpc.Payment_PaymentStatus, feeSat int64) *lnrpc.Payment {
+	return &lnrpc.Payment{Status: status, FeeSat: feeSat}
+}
+
+func TestGetPaymentResultTerminalFirstMessage(t *testing.T) {
+	router := &fakeRouter{stream: &fakeTrackStream{msgs: []*lnrpc.Payment{paymentMsg(lnrpc.Payment_SUCCEEDED, 7)}}}
+	svc := &Service{routerClient: router, trackTimeout: time.Second}
+	status, fee, err := svc.GetPaymentResult(context.Background(), []byte("hash"))
+	if err != nil || status != "SUCCEEDED" || fee != 7 {
+		t.Fatalf("GetPaymentResult() = %q, %d, %v; want SUCCEEDED, 7, nil", status, fee, err)
+	}
+	if router.gotReq == nil || !router.gotReq.NoInflightUpdates {
+		t.Fatal("TrackPaymentV2 was not asked to suppress in-flight updates")
+	}
+}
+
+func TestGetPaymentResultSkipsInflightMessages(t *testing.T) {
+	router := &fakeRouter{stream: &fakeTrackStream{msgs: []*lnrpc.Payment{
+		paymentMsg(lnrpc.Payment_IN_FLIGHT, 0),
+		paymentMsg(lnrpc.Payment_IN_FLIGHT, 3),
+		paymentMsg(lnrpc.Payment_SUCCEEDED, 42),
+	}}}
+	svc := &Service{routerClient: router, trackTimeout: time.Second}
+	status, fee, err := svc.GetPaymentResult(context.Background(), []byte("hash"))
+	if err != nil || status != "SUCCEEDED" || fee != 42 {
+		t.Fatalf("GetPaymentResult() = %q, %d, %v; want SUCCEEDED, 42, nil", status, fee, err)
+	}
+}
+
+func TestGetPaymentResultFailed(t *testing.T) {
+	router := &fakeRouter{stream: &fakeTrackStream{msgs: []*lnrpc.Payment{
+		paymentMsg(lnrpc.Payment_IN_FLIGHT, 0),
+		paymentMsg(lnrpc.Payment_FAILED, 0),
+	}}}
+	svc := &Service{routerClient: router, trackTimeout: time.Second}
+	status, fee, err := svc.GetPaymentResult(context.Background(), []byte("hash"))
+	if err != nil || status != "FAILED" || fee != 0 {
+		t.Fatalf("GetPaymentResult() = %q, %d, %v; want FAILED, 0, nil", status, fee, err)
+	}
+}
+
+func TestGetPaymentResultTimeoutReportsInflight(t *testing.T) {
+	router := &fakeRouter{stream: &fakeTrackStream{block: true}}
+	svc := &Service{routerClient: router, trackTimeout: 50 * time.Millisecond}
+	start := time.Now()
+	status, fee, err := svc.GetPaymentResult(context.Background(), []byte("hash"))
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("GetPaymentResult() blocked %v, want a bounded wait", elapsed)
+	}
+	if err != nil || status != "IN_FLIGHT" || fee != 0 {
+		t.Fatalf("GetPaymentResult() = %q, %d, %v; want IN_FLIGHT, 0, nil", status, fee, err)
+	}
+}
+
+func TestGetPaymentResultUnknownHash(t *testing.T) {
+	router := &fakeRouter{dialErr: status.Error(codes.NotFound, "payment not initiated")}
+	svc := &Service{routerClient: router, trackTimeout: time.Second}
+	if status, _, err := svc.GetPaymentResult(context.Background(), []byte("nope")); err == nil {
+		t.Fatalf("GetPaymentResult() = %q, nil; want NotFound error", status)
+	}
+}
+
+func TestGetPaymentResultEOFWithoutTerminal(t *testing.T) {
+	router := &fakeRouter{stream: &fakeTrackStream{}}
+	svc := &Service{routerClient: router, trackTimeout: time.Second}
+	status, fee, err := svc.GetPaymentResult(context.Background(), []byte("hash"))
+	if err != nil || status != "unknown" || fee != 0 {
+		t.Fatalf("GetPaymentResult() = %q, %d, %v; want unknown, 0, nil", status, fee, err)
 	}
 }
