@@ -21,3 +21,6 @@ Trace API to queue to node calls. Grafana dashboards: Payouts, Liquidity, Webhoo
 
 ## On-call
 Pager for critical alerts; documented runbooks linked from each alert.
+
+## Alert rules
+Loadable rules live in `monitoring/alerts.yml` (reconciliation criticals, ledger drift, payout hold rate, deposit settlement lag). The Alertmanager receiver is a team TODO: it needs paging-provider credentials before any page can fire.

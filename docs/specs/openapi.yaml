@@ -8,6 +8,12 @@ servers:
 security:
   - session: []
 paths:
+  /status:
+    get:
+      summary: Effective kill-switch state (public; drives the frontend pause banner)
+      security: []
+      responses:
+        '200': { description: Pause booleans and user message, content: { application/json: { schema: { type: object, properties: { funding_paused: { type: boolean }, outflows_paused: { type: boolean }, outflows_paused_by_env: { type: boolean }, message: { type: string } } } } } }
   /auth/github:
     get:
       summary: Start GitHub sign-in
@@ -15,6 +21,7 @@ paths:
       responses:
         '302': { description: Redirect to GitHub OAuth }
         '503': { description: GitHub OAuth is not configured }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /auth/github/callback:
     get:
       summary: Complete GitHub sign-in
@@ -24,6 +31,7 @@ paths:
         - { name: state, in: query, required: true, schema: { type: string } }
       responses:
         '302': { description: Redirect to the web app with a session cookie }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /waitlist:
     post:
       summary: Join waitlist
@@ -42,10 +50,11 @@ paths:
       security: []
       parameters:
         - { name: q, in: query, schema: { type: string } }
-        - { name: language, in: query, schema: { type: string } }
+        - { name: language, in: query, schema: { type: string }, description: 'Exact primary repository language (case-insensitive), e.g. Go' }
         - { name: difficulty, in: query, schema: { $ref: '#/components/schemas/Difficulty' } }
         - { name: min_reward, in: query, schema: { type: integer } }
         - { name: max_reward, in: query, schema: { type: integer } }
+        - { name: sort, in: query, schema: { type: string, enum: [newest, reward], default: newest }, description: 'Result order; cursors are sort-specific' }
         - { name: cursor, in: query, schema: { type: string } }
         - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
       responses:
@@ -75,13 +84,15 @@ paths:
         '201': { description: Claim created, content: { application/json: { schema: { $ref: '#/components/schemas/Claim' } } } }
         '200': { description: Existing claim returned for an idempotent retry, content: { application/json: { schema: { $ref: '#/components/schemas/Claim' } } } }
         '409': { description: Already claimed or not open, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '403': { description: Banned user, frozen project, or owner claiming own bounty }
-        '422': { description: Missing payout destination, too-new GitHub account, or ineligible }
+        '403': { description: 'Banned user, frozen project, or owner claiming own bounty' }
+        '422': { description: 'Missing payout destination, too-new GitHub account, or ineligible' }
+        '429': { $ref: '#/components/responses/RateLimited' }
     delete:
       summary: Release claim
       parameters: [ { $ref: '#/components/parameters/Id' } ]
       responses:
         '204': { description: Released }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /bounties/{id}/cancel:
     post:
       summary: Cancel bounty and refund reserved funds (maintainer)
@@ -111,7 +122,7 @@ paths:
         '200': { description: Dispute resolved }
         '403': { description: Only the project owner can resolve }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { description: Already resolved, no longer disputed, or no verified merge for a payout resolution }
+        '409': { description: 'Already resolved, no longer disputed, or no verified merge for a payout resolution' }
   /projects:
     post:
       summary: Register a project (maintainer with GitHub App installed)
@@ -141,6 +152,7 @@ paths:
         '502': { description: Lightning node failed to create an invoice }
         '503': { description: Lightning invoice service is unavailable }
         '500': { description: Invoice was created but deposit persistence failed }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /projects/{id}/withdrawals:
     post:
       summary: Withdraw unreserved funds (currently unavailable)
@@ -161,7 +173,7 @@ paths:
         '400': { description: Invalid or expired bounty expiry timestamp }
         '403': { description: Project is frozen }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { description: Duplicate issue bounty, or idempotency key reused with different data }
+        '409': { description: 'Duplicate issue bounty, or idempotency key reused with different data' }
   /me:
     get:
       summary: Current user
@@ -177,7 +189,7 @@ paths:
         '202': { description: Confirmation email sent; nothing changes until confirmed }
         '200': { description: Destination unchanged (same address) }
         '400': { description: Invalid Lightning address }
-        '401': { description: Unauthorized, or REAUTH_REQUIRED when the session is older than 15 minutes }
+        '401': { description: 'Unauthorized, or REAUTH_REQUIRED when the session is older than 15 minutes' }
         '500': { description: Confirmation email could not be sent }
   /me/payout-destination/confirm:
     post:
@@ -206,7 +218,7 @@ paths:
       parameters: [ { name: token, in: path, required: true, schema: { type: string } } ]
       responses:
         '200': { description: LNURL-withdraw response with exact-amount bounds }
-        '404': { description: Unknown or already-used claim link }
+        '404': { description: 'Unknown, already-used, or expired claim link' }
   /payouts/claim/callback:
     get:
       summary: LNURL-withdraw callback (called by the wallet with k1 and pr)
@@ -215,7 +227,7 @@ paths:
         - { name: k1, in: query, required: true, schema: { type: string } }
         - { name: pr, in: query, required: true, schema: { type: string, description: Exact-amount BOLT11 invoice } }
       responses:
-        '200': { description: '{status: OK} on success, {status: ERROR, reason} otherwise (link stays usable on payment failure)' }
+        '200': { description: '{status: OK} on success, {status: ERROR, reason} otherwise (link stays usable on payment failure; expired links are terminal)' }
         '404': { description: Unknown or already-used claim link }
   /projects/{id}/notifications:
     put:
@@ -235,6 +247,7 @@ paths:
       responses:
         '200': { description: Accepted (idempotent) }
         '401': { description: Invalid signature }
+        '429': { $ref: '#/components/responses/RateLimited' }
 components:
   securitySchemes:
     session: { type: apiKey, in: cookie, name: satlight_session }
@@ -244,6 +257,7 @@ components:
     IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 128 } }
   responses:
     NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Unauthorized: { description: Missing or invalid session, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     RateLimited: { description: Too many requests, headers: { Retry-After: { schema: { type: integer } } } }
   schemas:
     Difficulty: { type: string, enum: [trivial, easy, medium, hard] }

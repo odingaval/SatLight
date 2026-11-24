@@ -13,10 +13,10 @@ type LightningClient interface {
 ```
 
 ## Deposits
-1. Maintainer requests amount; API creates an invoice (1 hour expiry) and stores `deposits` row.
-2. Invoice subscription (plus a periodic poll as backup) marks the deposit `settled`.
+1. Maintainer requests amount; API creates an invoice (1 hour expiry, project-stamped memo) and stores `deposits` row.
+2. Invoice subscription marks the deposit `settled`; an hourly poller looks every pending deposit up at the node and credits settlements the stream missed (node-cancelled invoices expire their rows). A widowed-invoice sweep re-attaches settled invoices that lost their deposit rows.
 3. In one DB transaction: set deposit settled, write ledger entries (`node:liquidity` debit, `project:{id}:available` credit), update wallet.
-4. Overpayment is credited. Underpayment is normally prevented by fixed-amount BOLT11 invoices, but settlement handling must use the actual amount received. Per proposed [ADR-011](../011-late-deposits.md), the node determines expiry, known late settlements are credited at the actual received amount, and unknown receipts are quarantined for review. This policy is proposed and not implemented yet.
+4. Overpayment is credited. Underpayment is normally prevented by fixed-amount BOLT11 invoices, but settlement handling must use the actual amount received. Per accepted [ADR-011](../011-late-deposits.md), the node determines expiry, known late settlements are credited at the actual received amount, and unknown receipts are quarantined for review.
 
 ## Payouts (sequence)
 ```
@@ -28,6 +28,23 @@ worker: lock bounty row; verify state=merged and no payout exists
         success: TX: payout settled, bounty paid, ledger entries (payout, fee, routing cost)
         failure: record error; schedule retry
 ```
+
+## Macaroons (least privilege)
+The node connection is split in two; each side carries only the macaroon it needs:
+
+| Connection | Macaroon | Calls |
+|---|---|---|
+| Receive (`lightningClient`) | default `invoice.macaroon` (`invoices:read+write`) | AddInvoice, ListInvoices, LookupInvoice, SubscribeInvoices |
+| Send (`routerClient` + `paymentClient`) | baked `payment.macaroon` (`offchain:read+write`, `onchain:read`) | SendPaymentV2, TrackPaymentV2, DecodePayReq, WalletBalance, ChannelBalance |
+
+Decode and balance reads live on the send side deliberately: they need `offchain`/`onchain` reads the invoice macaroon must never have. Bake the payment macaroon with:
+
+```bash
+lncli bakemacaroon offchain:read offchain:write onchain:read \
+  --save_to=/data/chain/bitcoin/regtest/payment.macaroon
+```
+
+Never use the admin macaroon for app traffic: it can spend, close channels, and reconfigure the node. The regtest suite (`make test-ln`) is the one exception — throwaway test nodes where baking would add nothing.
 
 ## Rules
 - **Persist before pay.** The attempt and payment hash are committed before sending.

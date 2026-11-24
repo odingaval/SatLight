@@ -117,7 +117,7 @@ See [1.4](#14-success-metrics-specification-m2).
 | Total BTC distributed | Sum of settled payout amounts (sats) | ledger |
 | Payout success rate | Settled payouts / payout attempts on first try | events |
 
-Targets (first 6 months): 5 funded projects, 100 funded bounties before public launch, payout success rate above 98%, median payout time below 30s.
+Targets (first 6 months): 5 funded projects, 100 funded bounties before public launch, payout success rate above 98%, median payout time below 30s once the 10-minute merge-grace window elapses.
 
 ---
 
@@ -160,7 +160,7 @@ Decision:
 Consequences:
 ```
 
-Initial ADRs to write:
+Initial ADRs (all recorded under `docs/adr/`; 011–013 live at `docs/0*.md`):
 
 | ADR | Decision | Recommended default |
 |---|---|---|
@@ -564,7 +564,7 @@ Seed posts from the proposal:
 Voice: direct, practical, optimistic, never hype-y. Avoid price speculation and "get rich" language. Explain Bitcoin concepts in one sentence, link to deeper detail. Pillars: instant, global, fair, open.
 
 ## 8.5 Beta Program Plan [M4]
-Targets: 5 projects, 100 funded bounties, 50 unique contributors, median payout under 30s. Feedback loops: weekly office hours, in-app feedback, post-payout survey (NPS), bug triage board. Exit criteria for public launch: payout success rate above 98%, zero unreconciled funds, legal sign-off complete.
+Targets: 5 projects, 100 funded bounties, 50 unique contributors, median payout under 30s after the 10-minute merge-grace window. Feedback loops: weekly office hours, in-app feedback, post-payout survey (NPS), bug triage board. Exit criteria for public launch: payout success rate above 98%, zero unreconciled funds, legal sign-off complete.
 
 ---
 

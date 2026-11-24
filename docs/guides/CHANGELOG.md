@@ -5,6 +5,9 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 ## [Unreleased]
 ### Added
 - Initial documentation set, OpenAPI draft, database schema, ADRs.
+- Single-origin deployment: the API serves the embedded Vite build with an SPA fallback when `SERVE_STATIC=true`, so one URL hosts the UI and `/api/*` and session cookies stay same-origin (off by default; API 404s unchanged).
+- Render blueprint (`render.yaml`): Docker web service + background worker + managed Postgres with pre-deploy migrations; `BASE_URL`/`WEB_URL` default to `RENDER_EXTERNAL_URL` when unset.
+- Dockerfile now builds the web UI into the image and ships the `satlight-migrate` binary.
 - Idempotent bounty creation and claims: `Idempotency-Key` is now enforced, retries replay the original result, and key reuse with different data returns HTTP 409.
 - Dispute lifecycle: opening a dispute moves the bounty to `disputed`; project owners can resolve via `POST /disputes/{id}/resolve` (`resolved_pay` requires a verified merge, `resolved_cancel` refunds, `resolved_other` restores the pre-dispute state).
 - River queue schema migrations are now applied by `cmd/migrate` (previously missing, which broke bounty creation and claims).
@@ -18,6 +21,19 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 - `make migrate-down` now rolls back instead of migrating up.
 - Removed the raw `./migrations` postgres init mount that applied SQL outside versioning.
 - `make seed` writes ledger-backed demo data (deposit + reservation entries) and is safe to rerun.
+- Payment tracking waits for a terminal LND update (bounded 30s) instead of reading the first `TrackPaymentV2` message, so settled payouts book the final routing fee; inconclusive lookups after a successful send settle with a zero fee for reconciliation to true up rather than booking a partial in-flight fee.
+- Claim links expire after 30 days by default (`CLAIM_LINK_EXPIRY_DAYS`): redemption rejects expired links, and a worker returns the reserved reward to the project wallet with balanced ledger entries, an audit record, and a contributor notice.
+- Funding invoices carry a machine-readable project memo, and an hourly worker sweep (also run at startup) re-attaches settled node invoices that lost their deposit rows, crediting them through normal settlement and closing any quarantined receipt for the hash.
+- Deposit settlement has a poll backup: an hourly job looks every pending deposit up at the node (jittered, batched, with settlement-lag metrics), crediting stream-missed settlements and expiring node-cancelled invoices; settled arrivals without attribution (keysend, legacy memos) are quarantined for staff review instead of going unobserved.
+- Automatic payouts wait out a 10-minute force-revert grace window after the merge (`PAYOUT_MERGE_GRACE_MINUTES`, 0 disables); jobs inside the window reschedule for its end and the merge is re-verified just before sending, so a revert pushed minutes after merge holds the payout instead of racing it.
+- Kill switch reconciled: outflows stop when the `PAYOUTS_PAUSED` env override OR the database flag says so (previously the env flag was read nowhere); database flags clear only through an audited two-person resume (`cmd/opsctl` propose/approve), `GET /api/v1/status` feeds a frontend pause banner, and loadable Prometheus alert rules ship in `monitoring/alerts.yml` (Alertmanager receiver and game-day drill remain team TODOs).
+- LND regtest harness: `make test-ln` boots bitcoind + 2 LND nodes, funds and channels them, and proves deposit settlement, successful pays with fee accounting, no-route/offline/expiry/duplicate failures, and post-restart hash recovery against real nodes; runs nightly and on payout-code changes via CI. The harness caught two live send-path bugs: invoice decoding now runs on the payment connection (the invoice macaroon lacks `offchain:read`), and sends no longer set `Amt` on fixed-amount invoices (rejected by LND), with zero-amount invoices refused explicitly.
+- CI workflows (`.github/workflows/ci.yml`, `ln.yml`) run vet, unit + integration tests, OpenAPI validation, and the web build on every push, plus the regtest suite nightly; `make openapi` validates the real spec path with Redocly, and 11 pre-existing spec errors (unquoted descriptions, a dangling `Unauthorized` ref) are fixed.
+- Browse filters fixed: `sort=newest|reward` is honored server-side with sort-specific cursors (highest-reward is no longer a page-local client sort), and `language` matches the repository's real primary language from GitHub instead of substring-matching repo names.
+- Stale docs refreshed: ADR index statuses, documentation index links, backend limitations, and the ADR-011 implementation notes now match the code.
+- Least-privilege LND access: balance reads moved to the payment connection so the invoice macaroon needs only `invoices:read+write`; dev bakes a constrained payment macaroon (`offchain:read+write`, `onchain:read`) via `scripts/dev-macaroon.sh` instead of using admin, dev secrets generate per checkout via `scripts/dev-init.sh`, and the secrets-manager path for staging/prod is documented in the runbook. `queue.NewClient` returns construction errors instead of panicking.
+- Funding invoices render a scannable QR code (SVG, `lightning:` URI) above the copyable text for mobile wallets.
+- Ledger balance gate gains a fuzz test (`FuzzValidateEntries`) proving it accepts exactly the balanced, positive, overflow-free transactions.
 - CORS now allows the configured web origin instead of `*`.
 - The API server no longer panics on startup (the insert-only River client now registers the required worker set).
 - All bounty state changes go through a single audited transition function enforcing the lifecycle table.
@@ -41,3 +57,4 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 - LNURL-pay endpoints are fetched through an SSRF guard: https-only, no credentials, no private/link-local targets, redirect and DNS-rebinding protection.
 - Self-merged payouts are held for manual review with no claim link issued (previously auto-releasable via an emailed link). Manual release tooling is still to come.
 - Payout destination changes now require a valid Lightning address, a session signed in within the last 15 minutes, and email confirmation via `POST /me/payout-destination/confirm` (24-hour single-use links, 48-hour payout cooldown from confirmation).
+- Abuse-prone endpoints (claims, deposit invoices, GitHub webhooks, login, waitlist) are rate limited per user when signed in and per IP otherwise; denials answer 429 with `Retry-After` per the API contract, and limits are tunable via `RATE_LIMIT_*`.

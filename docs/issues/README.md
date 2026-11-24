@@ -7,8 +7,14 @@ labels, problem, evidence, and acceptance criteria. They were derived from the
 docs (`docs/SATLIGHT-DOCS.md`, specs, ADRs, M2 guide, testing strategy) and a
 code read of `internal/`, `cmd/`, `web/`, `migrations/`, and compose files.
 
-Drafts 001, 004, 005, and 007 are already fixed and verified in the
-working tree (`make test`, `make test-int` green); skip filing those.
+Already fixed and verified in the working tree (`make test`,
+`make test-int`, `make test-ln` green); skip filing those: 001, 002, 003,
+004, 005, 006, 007, 008, 009, 010, 011, 012, 014, 017, 018, 025, 027.
+Partially done (file with a note, or finish first): 023 (alert rules and
+settlement-lag metrics shipped; dashboards and remaining series outstanding),
+026 (ledger fuzz seed shipped; chaos harness and Playwright E2E outstanding).
+Still open: 013, 015, 016, 019, 020, 021 (legal), 022 (legal), 024 (product
+decision needed).
 
 File them with (requires `gh` auth against the repo above):
 

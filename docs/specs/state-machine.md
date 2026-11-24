@@ -15,7 +15,8 @@
 | merged | payout settled | paid | Ledger: payout + fee |
 | merged | payout fails | payout_failed | Retry schedule |
 | payout_failed | retry succeeds | paid | |
-| payout_failed | final failure | merged (claim link issued) | Email claim link |
+| payout_failed | final failure | merged (claim link issued) | Email claim link (30-day expiry) |
+| merged | claim link expires unclaimed | payout_failed | Release reserved funds to project wallet, email contributor |
 | open / claimed / in_review | dispute opened | disputed | Funds stay reserved |
 | disputed | resolved (pay) | merged | Enqueue payout |
 | disputed | resolved (cancel) | cancelled | Release funds |

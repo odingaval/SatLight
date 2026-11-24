@@ -27,4 +27,5 @@ Flag rate, false-positive rate, time to review, funds held.
 ## Implementation notes (fraud controls v1)
 Implemented: frozen/banned enforcement, owner self-claim block, minimum GitHub account age (applies to all claims when enabled, default off), max active claims per contributor (default 3), reciprocal-pattern flags in reconciliation, per-project trailing-24h payout cap (default 1M sats).
 Implemented: payout address changes require format validation, a fresh sign-in (15 minutes), and email confirmation before the 48-hour cooldown starts.
-Not yet implemented: public-activity checks, new-contributor caps, manual review queue UI, rate limiting. These remain required before public launch.
+Implemented: per-IP/per-user token-bucket rate limits on claims, deposit invoices, webhooks, login, and waitlist (429 with Retry-After, configurable via RATE_LIMIT_*).
+Not yet implemented: public-activity checks, new-contributor caps, manual review queue UI. These remain required before public launch.
