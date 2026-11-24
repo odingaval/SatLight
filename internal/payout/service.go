@@ -45,6 +45,7 @@ var (
 	ErrInvalidDestination    = errors.New("invalid payout destination")
 	ErrNoPayoutClaimant      = errors.New("merged bounty has no active claim")
 	ErrClaimLinkUsed         = errors.New("claim link already used")
+	ErrClaimLinkExpired      = errors.New("claim link expired")
 	ErrInvoiceAmountMismatch = errors.New("invoice amount mismatch")
 )
 
@@ -100,6 +101,7 @@ type payoutContext struct {
 	destination string
 	changedAt   *time.Time
 	selfMerged  bool
+	mergedAt    *time.Time
 }
 
 type storedPayout struct {
@@ -138,14 +140,15 @@ func (s *Service) loadPayoutContext(ctx context.Context, bountyID int64) (*payou
 		SELECT b.project_id, p.owner_user_id, b.reward_sats, b.fee_sats, c.user_id,
 		       COALESCE(u.lightning_address, ''), u.payout_changed_at,
 		       EXISTS(SELECT 1 FROM pull_requests pr WHERE pr.claim_id = c.id AND pr.merged
-		              AND pr.merged_by_github_id IS NOT NULL AND pr.merged_by_github_id = pr.author_github_id)
+		              AND pr.merged_by_github_id IS NOT NULL AND pr.merged_by_github_id = pr.author_github_id),
+		       (SELECT MAX(pr.merged_at) FROM pull_requests pr WHERE pr.claim_id = c.id AND pr.merged)
 		FROM bounties b
 		JOIN projects p ON b.project_id = p.id
 		JOIN claims c ON c.bounty_id = b.id AND c.status = 'active'
 		JOIN users u ON c.user_id = u.id
 		WHERE b.id = $1
 	`, bountyID).Scan(&pctx.projectID, &pctx.ownerID, &pctx.rewardSats, &pctx.feeSats,
-		&pctx.userID, &pctx.destination, &pctx.changedAt, &pctx.selfMerged)
+		&pctx.userID, &pctx.destination, &pctx.changedAt, &pctx.selfMerged, &pctx.mergedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNoPayoutClaimant
 	}
@@ -157,6 +160,12 @@ func (s *Service) loadPayoutContext(ctx context.Context, bountyID int64) (*payou
 }
 
 func (s *Service) outflowsPaused(ctx context.Context) (bool, error) {
+	// Either switch pauses outflows: the emergency env override (no database
+	// needed, but requires a restart to lift) or the database flag (instant,
+	// cleared only through the two-person resume). See the runbook.
+	if s.cfg.PayoutsPaused {
+		return true, nil
+	}
 	var paused bool
 	if err := s.pool.QueryRow(ctx, `SELECT enabled FROM system_flags WHERE name = 'outflows_paused'`).Scan(&paused); err != nil {
 		return true, err
@@ -387,7 +396,9 @@ func (s *Service) ProcessBountyPayout(ctx context.Context, bountyID int64) error
 	}
 	if existing != nil {
 		switch existing.status {
-		case "settled", "claimed_via_link", "claim_link_issued":
+		case "settled", "claimed_via_link", "claim_link_issued", "expired":
+			// Terminal or awaiting the contributor: only a manual release
+			// may revive an expired payout, never the automatic job.
 			return nil
 		}
 		if len(existing.paymentHash) > 0 {
@@ -414,6 +425,11 @@ func (s *Service) ProcessBountyPayout(ctx context.Context, bountyID int64) error
 			return nil
 		}
 		return err
+	}
+	if deferred, err := s.deferForMergeGraceWindow(ctx, pctx); err != nil {
+		return err
+	} else if deferred {
+		return nil
 	}
 	if pctx.destination == "" {
 		s.log.Error().Int64("bounty_id", bountyID).Msg("claimant has no payout destination; payout held for manual review")
@@ -451,11 +467,41 @@ func (s *Service) ProcessBountyPayout(ctx context.Context, bountyID int64) error
 	if err != nil {
 		return s.recordSendFailure(ctx, pctx, err.Error())
 	}
-	_, fee, trackErr := s.lightning.GetPaymentResult(ctx, sentHash)
-	if trackErr != nil {
+	status, fee, trackErr := s.lightning.GetPaymentResult(ctx, sentHash)
+	if trackErr != nil || status != "SUCCEEDED" {
+		// PayInvoice already confirmed the funds moved; settle now with a
+		// zero fee and let reconciliation true up the routing cost rather
+		// than booking a partial in-flight fee.
+		s.log.Warn().Int64("bounty_id", pctx.bountyID).Str("status", status).Err(trackErr).Msg("payment tracking inconclusive after successful send; settling with zero fee")
 		fee = 0
 	}
 	return s.settlePayout(ctx, payoutID, sentHash, fee, "settled")
+}
+
+// deferForMergeGraceWindow holds payouts inside the force-revert grace window
+// by rescheduling the job for the window's end, when VerifyMergeFresh gets
+// its say. Merges without a recorded timestamp proceed to the existing
+// checks; a zero grace duration disables the wait.
+func (s *Service) deferForMergeGraceWindow(ctx context.Context, pctx *payoutContext) (bool, error) {
+	grace := s.cfg.PayoutMergeGraceDuration()
+	if grace <= 0 || pctx.mergedAt == nil {
+		return false, nil
+	}
+	fireAt := pctx.mergedAt.Add(grace)
+	if !time.Now().Before(fireAt) {
+		return false, nil
+	}
+	if s.queue == nil {
+		return false, errors.New("payout queue is not configured")
+	}
+	s.log.Info().Int64("bounty_id", pctx.bountyID).Time("pay_after", fireAt).Msg("merge is inside the force-revert grace window; payout deferred")
+	if err := s.queue.Insert(ctx, queue.ProcessPayoutArgs{BountyID: pctx.bountyID}, river.InsertOpts{
+		Queue:       "payouts",
+		ScheduledAt: fireAt,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 var errBountyLeftMerged = errors.New("bounty is no longer merged")
@@ -475,6 +521,9 @@ func (s *Service) persistSendingAttempt(ctx context.Context, pctx *payoutContext
 	}
 	if state != "merged" {
 		return 0, errBountyLeftMerged
+	}
+	if s.cfg.PayoutsPaused {
+		return 0, ErrOutflowsPaused
 	}
 	var paused bool
 	if err := tx.QueryRow(ctx, `SELECT enabled FROM system_flags WHERE name = 'outflows_paused' FOR SHARE`).Scan(&paused); err != nil {
@@ -540,8 +589,17 @@ func (s *Service) recordSendFailure(ctx context.Context, pctx *payoutContext, re
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE payouts SET status = 'claim_link_issued', claim_link_token = $1 WHERE id = $2`, token, payoutID); err != nil {
+		linkExpiry := time.Now().Add(s.cfg.ClaimLinkExpiryDuration())
+		if _, err := tx.Exec(ctx, `UPDATE payouts SET status = 'claim_link_issued', claim_link_token = $1, claim_link_expires_at = $2 WHERE id = $3`, token, linkExpiry, payoutID); err != nil {
 			return err
+		}
+		if s.queue != nil {
+			if err := s.queue.InsertTx(ctx, tx, queue.PayoutClaimExpiryArgs{PayoutID: payoutID}, river.InsertOpts{
+				Queue:       "payouts",
+				ScheduledAt: linkExpiry,
+			}); err != nil {
+				return err
+			}
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return err
@@ -696,12 +754,16 @@ type WithdrawRequest struct {
 // GetWithdrawRequest loads the claim-link payout behind a token.
 func (s *Service) GetWithdrawRequest(ctx context.Context, token string) (*WithdrawRequest, error) {
 	var amountSats int64
-	err := s.pool.QueryRow(ctx, `SELECT amount_sats FROM payouts WHERE claim_link_token = $1 AND status = 'claim_link_issued'`, token).Scan(&amountSats)
+	var expiresAt *time.Time
+	err := s.pool.QueryRow(ctx, `SELECT amount_sats, claim_link_expires_at FROM payouts WHERE claim_link_token = $1 AND status = 'claim_link_issued'`, token).Scan(&amountSats, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, sql.ErrNoRows
 	}
 	if err != nil {
 		return nil, err
+	}
+	if expiresAt == nil || !expiresAt.After(time.Now()) {
+		return nil, ErrClaimLinkExpired
 	}
 	return &WithdrawRequest{
 		CallbackURL:        strings.TrimRight(s.cfg.BaseURL, "/") + "/api/v1/payouts/claim/callback",
@@ -728,7 +790,8 @@ func (s *Service) RedeemClaimLink(ctx context.Context, token, bolt11 string) err
 
 	var payoutID, amountSats int64
 	var status string
-	err = tx.QueryRow(ctx, `SELECT id, amount_sats, status FROM payouts WHERE claim_link_token = $1 FOR UPDATE`, token).Scan(&payoutID, &amountSats, &status)
+	var expiresAt *time.Time
+	err = tx.QueryRow(ctx, `SELECT id, amount_sats, status, claim_link_expires_at FROM payouts WHERE claim_link_token = $1 FOR UPDATE`, token).Scan(&payoutID, &amountSats, &status, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sql.ErrNoRows
 	}
@@ -737,6 +800,9 @@ func (s *Service) RedeemClaimLink(ctx context.Context, token, bolt11 string) err
 	}
 	if status != "claim_link_issued" {
 		return ErrClaimLinkUsed
+	}
+	if expiresAt == nil || !expiresAt.After(time.Now()) {
+		return ErrClaimLinkExpired
 	}
 	if payReq.NumSatoshis != amountSats {
 		return fmt.Errorf("%w: invoice has %d sats, want %d", ErrInvoiceAmountMismatch, payReq.NumSatoshis, amountSats)
@@ -759,9 +825,110 @@ func (s *Service) RedeemClaimLink(ctx context.Context, token, bolt11 string) err
 		_, _ = s.pool.Exec(ctx, `UPDATE payouts SET status = 'claim_link_issued', last_error = $1 WHERE id = $2`, err.Error(), payoutID)
 		return err
 	}
-	_, fee, trackErr := s.lightning.GetPaymentResult(ctx, sentHash)
-	if trackErr != nil {
+	status, fee, trackErr := s.lightning.GetPaymentResult(ctx, sentHash)
+	if trackErr != nil || status != "SUCCEEDED" {
+		// PayInvoice already confirmed the funds moved; settle now with a
+		// zero fee and let reconciliation true up the routing cost rather
+		// than booking a partial in-flight fee.
+		s.log.Warn().Int64("payout_id", payoutID).Str("status", status).Err(trackErr).Msg("payment tracking inconclusive after successful claim redemption; settling with zero fee")
 		fee = 0
 	}
 	return s.settlePayout(ctx, payoutID, sentHash, fee, "claimed_via_link")
+}
+
+// ExpireClaimLink runs when a claim link passes its expiry: the link dies,
+// the reserved reward returns to the project wallet, and the contributor is
+// told the funds went back. It is idempotent: links that already redeemed,
+// failed, or expired are a silent success.
+func (s *Service) ExpireClaimLink(ctx context.Context, payoutID int64) error {
+	if s.ledger == nil || s.notify == nil {
+		return errors.New("payout dependencies are not configured")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var row struct {
+		bountyID  int64
+		userID    int64
+		amount    int64
+		status    string
+		expiresAt *time.Time
+	}
+	var projectID, rewardSats int64
+	var bountyState string
+	err = tx.QueryRow(ctx, `
+		SELECT p.bounty_id, p.user_id, p.amount_sats, p.status, p.claim_link_expires_at,
+		       b.project_id, b.reward_sats, b.state
+		FROM payouts p JOIN bounties b ON p.bounty_id = b.id
+		WHERE p.id = $1 FOR UPDATE OF p, b
+	`, payoutID).Scan(&row.bountyID, &row.userID, &row.amount, &row.status, &row.expiresAt,
+		&projectID, &rewardSats, &bountyState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if row.status != "claim_link_issued" {
+		return tx.Commit(ctx)
+	}
+	if row.expiresAt != nil && row.expiresAt.After(time.Now()) {
+		// Fired early (clock moved or manual trigger): come back at expiry
+		// so the funds cannot strand in limbo.
+		if s.queue == nil {
+			s.log.Error().Int64("payout_id", payoutID).Msg("claim-link expiry fired early with no queue to reschedule on")
+			return tx.Commit(ctx)
+		}
+		if err := s.queue.InsertTx(ctx, tx, queue.PayoutClaimExpiryArgs{PayoutID: payoutID}, river.InsertOpts{
+			Queue:       "payouts",
+			ScheduledAt: *row.expiresAt,
+		}); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE payouts SET status = 'expired', claim_link_token = NULL, last_error = 'claim link expired; funds returned to project' WHERE id = $1`, payoutID); err != nil {
+		return err
+	}
+	result, err := tx.Exec(ctx, `UPDATE wallets SET available_sats = available_sats + $1, reserved_sats = reserved_sats - $1, updated_at = now() WHERE project_id = $2 AND reserved_sats >= $1`, rewardSats, projectID)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("project wallet is missing or has insufficient reserved funds for claim-link expiry")
+	}
+	if err := s.ledger.RefundBountyFunds(ctx, tx, projectID, row.bountyID, rewardSats); err != nil {
+		return err
+	}
+	if bountyState == "merged" {
+		if err := bounty.TransitionBounty(ctx, tx, bounty.Transition{
+			BountyID: row.bountyID, From: "merged", To: "payout_failed",
+			Actor: "system", Action: "payout.expired",
+			Metadata: map[string]any{"payout_id": payoutID, "returned_sats": rewardSats},
+		}); err != nil {
+			return err
+		}
+	} else {
+		s.log.Error().Int64("bounty_id", row.bountyID).Str("state", bountyState).Msg("claim link expired while bounty not merged; funds returned, state left alone")
+	}
+	if _, err := tx.Exec(ctx, `UPDATE claims SET status = 'expired' WHERE bounty_id = $1 AND status = 'active'`, row.bountyID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_log (actor, action, subject, metadata)
+		VALUES ('system', 'payout.expired', $1, $2::jsonb)
+	`, "payout:"+strconv.FormatInt(payoutID, 10), fmt.Sprintf(`{"bounty_id":%d,"returned_sats":%d}`, row.bountyID, rewardSats)); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	metrics.PayoutsCompleted.WithLabelValues("expired").Inc()
+	if err := s.notify.NotifyClaimLinkExpired(ctx, row.userID, row.bountyID, row.amount); err != nil {
+		s.log.Error().Err(err).Msg("failed to send claim-link-expired notification")
+	}
+	return nil
 }

@@ -15,12 +15,27 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivermigrate"
 	"github.com/satlight/satlight/internal/config"
 	"github.com/satlight/satlight/internal/ledger"
+	"github.com/satlight/satlight/internal/lightning"
+	"github.com/satlight/satlight/internal/metrics"
 	"github.com/satlight/satlight/internal/queue"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+func mustQueueClient(t *testing.T, pool *pgxpool.Pool) *queue.Client {
+	t.Helper()
+	client, err := queue.NewClient(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
 
 func integrationFixture(t *testing.T) (*Service, *pgxpool.Pool, int64) {
 	t.Helper()
@@ -75,7 +90,7 @@ func integrationFixture(t *testing.T) (*Service, *pgxpool.Pool, int64) {
 		t.Fatal(err)
 	}
 	service := NewService(&config.Config{MinRewardSats: 500, ClaimExpiryDays: 7, BountyDefaultExpiryDays: 90}, pool)
-	service.SetDependencies(ledger.NewService(nil, pool), queue.NewClient(pool))
+	service.SetDependencies(ledger.NewService(nil, pool), mustQueueClient(t, pool))
 	return service, pool, projectID
 }
 
@@ -199,7 +214,22 @@ func TestIntegrationBountySearchFiltersAndCursorWorkTogether(t *testing.T) {
 	service, pool, projectID := integrationFixture(t)
 	ctx := context.Background()
 	repo := "golang/integration-" + uuid.NewString()[:8]
-	if _, err := pool.Exec(ctx, `UPDATE projects SET repo_full_name = $1 WHERE id = $2`, repo, projectID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE projects SET repo_full_name = $1, language = 'Go' WHERE id = $2`, repo, projectID); err != nil {
+		t.Fatal(err)
+	}
+	// A Python project whose repo name contains "go": it must never match a
+	// Go language filter now that matching uses real language data.
+	var ownerID int64
+	if err := pool.QueryRow(ctx, `SELECT owner_user_id FROM projects WHERE id = $1`, projectID).Scan(&ownerID); err != nil {
+		t.Fatal(err)
+	}
+	var otherProject int64
+	decoyRepo := "django/decoy-" + uuid.NewString()[:8]
+	decoyMarker := "decoy-" + uuid.NewString()[:8]
+	if err := pool.QueryRow(ctx, `INSERT INTO projects (owner_user_id, github_installation_id, repo_full_name, language) VALUES ($1, $2, $3, 'Python') RETURNING id`, ownerID, time.Now().UnixNano(), decoyRepo).Scan(&otherProject); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO bounties (project_id, github_issue_number, title, description, difficulty, reward_sats, fee_sats, state, expires_at) VALUES ($1, 9, $2, 'Python docs', 'easy', 1200, 20, 'open', now() + interval '1 day')`, otherProject, decoyMarker); err != nil {
 		t.Fatal(err)
 	}
 	fixtures := []struct {
@@ -222,7 +252,8 @@ func TestIntegrationBountySearchFiltersAndCursorWorkTogether(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	filters := ListFilters{Query: "docs", Language: "golang", Difficulty: "easy", MinReward: 1000, MaxReward: 2000, Limit: 1}
+	// Case-insensitive exact language match across the combined filters.
+	filters := ListFilters{Query: "docs", Language: "go", Difficulty: "easy", MinReward: 1000, MaxReward: 2000, Limit: 1}
 	firstPage, cursor, err := service.ListBounties(ctx, filters)
 	if err != nil {
 		t.Fatal(err)
@@ -237,6 +268,72 @@ func TestIntegrationBountySearchFiltersAndCursorWorkTogether(t *testing.T) {
 	}
 	if len(secondPage) != 1 || nextCursor != "" || firstPage[0].ID == secondPage[0].ID {
 		t.Fatalf("second page has %d bounties, cursor %q; want the other matching result and no next page", len(secondPage), nextCursor)
+	}
+	// Substrings no longer match, and neither do other languages.
+	for _, language := range []string{"olan", "golang", "Python"} {
+		results, _, err := service.ListBounties(ctx, ListFilters{Query: "docs", Language: language, Difficulty: "easy", MinReward: 1000, MaxReward: 2000})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bounty := range results {
+			if bounty.ProjectID == projectID {
+				t.Fatalf("language %q matched the Go project", language)
+			}
+		}
+		if language != "Python" && len(results) != 0 {
+			t.Fatalf("language %q matched %d bounties, want 0", language, len(results))
+		}
+	}
+	// The Python decoy is findable by its own marker (scoped: other runs may
+	// have left decoys of their own behind).
+	decoyResults, _, err := service.ListBounties(ctx, ListFilters{Query: decoyMarker, Language: "Python"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoyResults) != 1 || decoyResults[0].ProjectID != otherProject {
+		t.Fatalf("Python decoy lookup matched %d bounties, want exactly this test's", len(decoyResults))
+	}
+}
+
+func TestIntegrationBountyRewardSortPages(t *testing.T) {
+	service, pool, projectID := integrationFixture(t)
+	ctx := context.Background()
+	// Unique query text scopes the listing to this test's rows: the database
+	// is shared with every other test in the package.
+	marker := "sortme-" + uuid.NewString()[:8]
+	for i, reward := range []int64{1000, 3000, 2000} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO bounties (project_id, github_issue_number, title, description, difficulty, reward_sats, fee_sats, state, expires_at)
+			VALUES ($1, $2, $3, 'sort', 'easy', $4, 20, 'open', now() + interval '1 day')
+		`, projectID, 100+i, marker, reward); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstPage, cursor, err := service.ListBounties(ctx, ListFilters{Query: marker, Sort: "reward", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstPage) != 2 || cursor == "" {
+		t.Fatalf("first page has %d bounties, cursor %q; want 2 and a cursor", len(firstPage), cursor)
+	}
+	if firstPage[0].RewardSats != 3000 || firstPage[1].RewardSats != 2000 {
+		t.Fatalf("reward order = [%d %d], want [3000 2000]", firstPage[0].RewardSats, firstPage[1].RewardSats)
+	}
+	secondPage, nextCursor, err := service.ListBounties(ctx, ListFilters{Query: marker, Sort: "reward", Limit: 2, Cursor: cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondPage) != 1 || nextCursor != "" || secondPage[0].RewardSats != 1000 {
+		t.Fatalf("second page = %d bounties cursor %q, want the 1000-sat remainder", len(secondPage), nextCursor)
+	}
+	// Cursors are sort-specific: a newest cursor is invalid under reward sort.
+	newestCursor := encodeBountyCursor(secondPage[0].CreatedAt, secondPage[0].ID)
+	if _, _, err := service.ListBounties(ctx, ListFilters{Query: marker, Sort: "reward", Cursor: newestCursor}); err == nil {
+		t.Fatal("reward sort with a newest cursor = nil, want ErrInvalidCursor")
+	}
+	// Unknown sorts fall back to newest.
+	if _, _, err := service.ListBounties(ctx, ListFilters{Query: marker, Sort: "bogus", Limit: 1}); err != nil {
+		t.Fatalf("unknown sort: err=%v, want newest fallback", err)
 	}
 }
 
@@ -586,7 +683,7 @@ func TestIntegrationClaimEnforcesGitHubAccountAge(t *testing.T) {
 	service, pool, projectID := integrationFixture(t)
 	ctx := context.Background()
 	aged := NewService(&config.Config{MinRewardSats: 500, ClaimExpiryDays: 7, BountyDefaultExpiryDays: 90, ClaimMinGitHubAccountAgeDays: 30}, pool)
-	aged.SetDependencies(ledger.NewService(nil, pool), queue.NewClient(pool))
+	aged.SetDependencies(ledger.NewService(nil, pool), mustQueueClient(t, pool))
 	if _, err := pool.Exec(ctx, `UPDATE wallets SET available_sats = 100000 WHERE project_id = $1`, projectID); err != nil {
 		t.Fatal(err)
 	}
@@ -630,7 +727,7 @@ func TestIntegrationClaimEnforcesMaxActiveClaims(t *testing.T) {
 	_, pool, projectID := integrationFixture(t)
 	ctx := context.Background()
 	limited := NewService(&config.Config{MinRewardSats: 500, ClaimExpiryDays: 7, BountyDefaultExpiryDays: 90, ClaimMaxActiveClaims: 1}, pool)
-	limited.SetDependencies(ledger.NewService(nil, pool), queue.NewClient(pool))
+	limited.SetDependencies(ledger.NewService(nil, pool), mustQueueClient(t, pool))
 	if _, err := pool.Exec(ctx, `UPDATE wallets SET available_sats = 100000 WHERE project_id = $1`, projectID); err != nil {
 		t.Fatal(err)
 	}
@@ -770,4 +867,249 @@ func TestIntegrationProjectPayoutCapEnforced(t *testing.T) {
 	if err := ledgerService.CheckProjectPayoutCap(ctx, projectID, 1<<40, 0); err != nil {
 		t.Fatalf("disabled cap: err=%v, want nil", err)
 	}
+}
+
+type scriptedInvoiceReader struct {
+	invoices  []lightning.SettledInvoice
+	listErr   error
+	statuses  map[string]lightning.InvoiceStatus
+	lookupErr map[string]error
+}
+
+func (f *scriptedInvoiceReader) ListSettledInvoices(context.Context) ([]lightning.SettledInvoice, error) {
+	return f.invoices, f.listErr
+}
+
+func (f *scriptedInvoiceReader) LookupInvoice(_ context.Context, hash []byte) (lightning.InvoiceStatus, error) {
+	key := string(hash)
+	if err, ok := f.lookupErr[key]; ok {
+		return lightning.InvoiceStatus{}, err
+	}
+	if st, ok := f.statuses[key]; ok {
+		return st, nil
+	}
+	return lightning.InvoiceStatus{}, errors.New("invoice not scripted")
+}
+
+// A settled node invoice with no deposit row is exactly the state a crash
+// between AddInvoice and commit (or a DB restore) leaves behind: the money
+// arrived but the mapping is gone. The sweep must recreate the row, credit
+// it, and close any quarantined receipt for the hash.
+func TestIntegrationWidowedInvoiceSweepReattachesDeposits(t *testing.T) {
+	service, pool, projectID := integrationFixture(t)
+	ctx := context.Background()
+
+	widowed := uuid.New()
+	widowedBare := uuid.New()
+	known := uuid.New()
+	foreign := uuid.New()
+	if _, err := service.CreateDeposit(ctx, projectID, "known-"+uuid.NewString(), "lnbc-known", known[:], 1000, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordUnmatchedReceipt(ctx, widowed[:], 5000); err != nil {
+		t.Fatal(err)
+	}
+	lister := &scriptedInvoiceReader{invoices: []lightning.SettledInvoice{
+		{PaymentHash: widowed[:], Bolt11: "lnbc-widowed", ValueSats: 5000, AmountPaidSats: 5000, Memo: DepositInvoiceMemo(projectID), SettledAt: time.Now().Add(-time.Hour)},
+		{PaymentHash: widowedBare[:], Bolt11: "lnbc-bare", ValueSats: 3000, AmountPaidSats: 3000, Memo: DepositInvoiceMemo(projectID), SettledAt: time.Now().Add(-time.Hour)},
+		{PaymentHash: known[:], Bolt11: "lnbc-known", ValueSats: 1000, AmountPaidSats: 1000, Memo: DepositInvoiceMemo(projectID), SettledAt: time.Now().Add(-time.Hour)},
+		{PaymentHash: foreign[:], Bolt11: "lnbc-foreign", ValueSats: 7000, AmountPaidSats: 7000, Memo: "someone else's invoice", SettledAt: time.Now().Add(-time.Hour)},
+	}}
+	service.SetInvoiceReader(lister)
+
+	reattached, err := service.ReconcileWidowedInvoices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reattached != 2 {
+		t.Fatalf("reattached = %d, want 2 (known deposit kept, foreign invoice quarantined)", reattached)
+	}
+	var foreignDeposits int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM deposits WHERE payment_hash = $1`, foreign[:]).Scan(&foreignDeposits); err != nil {
+		t.Fatal(err)
+	}
+	if foreignDeposits != 0 {
+		t.Fatalf("foreign deposits = %d, want 0 (never credited blindly)", foreignDeposits)
+	}
+	var foreignReceipt string
+	if err := pool.QueryRow(ctx, `SELECT status FROM unmatched_receipts WHERE payment_hash = $1`, foreign[:]).Scan(&foreignReceipt); err != nil {
+		t.Fatalf("foreign settlement was not quarantined: %v", err)
+	}
+	if foreignReceipt != "open" {
+		t.Fatalf("foreign receipt status = %q, want open for staff review", foreignReceipt)
+	}
+	for _, tc := range []struct {
+		hash []byte
+		want int64
+	}{
+		{widowed[:], 5000},
+		{widowedBare[:], 3000},
+	} {
+		var status string
+		var received int64
+		var depositID int64
+		if err := pool.QueryRow(ctx, `SELECT id, status, received_sats FROM deposits WHERE payment_hash = $1`, tc.hash).Scan(&depositID, &status, &received); err != nil {
+			t.Fatalf("recreated deposit missing for %x: %v", tc.hash, err)
+		}
+		if status != "settled" || received != tc.want {
+			t.Fatalf("deposit %d: status=%q received=%d, want settled/%d", depositID, status, received, tc.want)
+		}
+		var debits, credits int64
+		if err := pool.QueryRow(ctx, `
+			SELECT COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount_sats END), 0),
+			       COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount_sats END), 0)
+			FROM ledger_entries WHERE ref_type = 'deposit' AND ref_id = $1
+		`, depositID).Scan(&debits, &credits); err != nil {
+			t.Fatal(err)
+		}
+		if debits != credits || debits != tc.want {
+			t.Fatalf("deposit %d ledger: debits=%d credits=%d, want balanced %d", depositID, debits, credits, tc.want)
+		}
+	}
+	var receiptStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM unmatched_receipts WHERE payment_hash = $1`, widowed[:]).Scan(&receiptStatus); err != nil {
+		t.Fatal(err)
+	}
+	if receiptStatus != "credited" {
+		t.Fatalf("quarantined receipt status = %q, want credited", receiptStatus)
+	}
+	var knownStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM deposits WHERE payment_hash = $1`, known[:]).Scan(&knownStatus); err != nil {
+		t.Fatal(err)
+	}
+	if knownStatus != "pending" {
+		t.Fatalf("known deposit status = %q, want pending (untouched)", knownStatus)
+	}
+	var available int64
+	if err := pool.QueryRow(ctx, `SELECT available_sats FROM wallets WHERE project_id = $1`, projectID).Scan(&available); err != nil {
+		t.Fatal(err)
+	}
+	if available != 8000 {
+		t.Fatalf("wallet available = %d, want 8000", available)
+	}
+	var audits int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE action = 'deposit.reattached' AND subject = $1`, "project:"+fmt.Sprint(projectID)).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 2 {
+		t.Fatalf("deposit.reattached audit entries = %d, want 2", audits)
+	}
+	// A second sweep finds nothing new.
+	if reattached, err := service.ReconcileWidowedInvoices(ctx); err != nil || reattached != 0 {
+		t.Fatalf("second sweep = (%d, %v), want (0, nil)", reattached, err)
+	}
+}
+
+func TestIntegrationWidowedInvoiceSweepFailsOnNodeError(t *testing.T) {
+	service, _, _ := integrationFixture(t)
+	service.SetInvoiceReader(&scriptedInvoiceReader{listErr: errors.New("node down")})
+	if _, err := service.ReconcileWidowedInvoices(context.Background()); err == nil {
+		t.Fatal("sweep with a failing node = nil, want error so the scheduler retries")
+	}
+	service.SetInvoiceReader(nil)
+	if n, err := service.ReconcileWidowedInvoices(context.Background()); err != nil || n != 0 {
+		t.Fatalf("sweep without a reader = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+// The stream dropped these settlements; the poller must discover them by
+// looking each pending deposit up at the node.
+func TestIntegrationDepositPollerSettlesMissedUpdates(t *testing.T) {
+	service, pool, projectID := integrationFixture(t)
+	ctx := context.Background()
+	service.pollJitter = func() {}
+
+	newDeposit := func(key string, amount int64) []byte {
+		t.Helper()
+		hash := uuid.New()
+		if _, err := service.CreateDeposit(ctx, projectID, key, "lnbc-"+key, hash[:], amount, time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		return hash[:]
+	}
+	settledHash := newDeposit("poll-settled", 1500)
+	canceledHash := newDeposit("poll-canceled", 1000)
+	openHash := newDeposit("poll-open", 1000)
+	missingHash := newDeposit("poll-missing", 1000)
+	flakyHash := newDeposit("poll-flaky", 1000)
+
+	service.SetInvoiceReader(&scriptedInvoiceReader{
+		statuses: map[string]lightning.InvoiceStatus{
+			string(settledHash):  {Settled: true, PaidSats: 1500, SettledAt: time.Now().Add(-30 * time.Minute)},
+			string(canceledHash): {Canceled: true},
+			// openHash stays open at the node: no entry means open here.
+		},
+		lookupErr: map[string]error{
+			string(missingHash): status.Error(codes.NotFound, "invoice not found"),
+			string(flakyHash):   errors.New("timeout"),
+		},
+	})
+	// The open invoice reports a zero status (neither settled nor canceled).
+	reader := service.invoiceReader.(*scriptedInvoiceReader)
+	reader.statuses[string(openHash)] = lightning.InvoiceStatus{}
+
+	before := settlementLagCount(t)
+	credited, err := service.PollPendingDeposits(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credited != 1 {
+		t.Fatalf("poll credited = %d, want 1", credited)
+	}
+	statusOf := func(hash []byte) string {
+		t.Helper()
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status FROM deposits WHERE payment_hash = $1`, hash).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		return status
+	}
+	if got := statusOf(settledHash); got != "settled" {
+		t.Fatalf("settled deposit = %q, want settled", got)
+	}
+	if got := statusOf(canceledHash); got != "expired" {
+		t.Fatalf("canceled deposit = %q, want expired", got)
+	}
+	for name, hash := range map[string][]byte{"open": openHash, "missing": missingHash, "flaky": flakyHash} {
+		if got := statusOf(hash); got != "pending" {
+			t.Fatalf("%s deposit = %q, want pending", name, got)
+		}
+	}
+	var available int64
+	if err := pool.QueryRow(ctx, `SELECT available_sats FROM wallets WHERE project_id = $1`, projectID).Scan(&available); err != nil {
+		t.Fatal(err)
+	}
+	if available != 1500 {
+		t.Fatalf("wallet available = %d, want 1500", available)
+	}
+	if got := settlementLagCount(t); got != before+1 {
+		t.Fatalf("settlement lag observations = %d, want %d", got, before+1)
+	}
+}
+
+func TestIntegrationDepositPollerFailsWhenNodeIsDown(t *testing.T) {
+	service, _, projectID := integrationFixture(t)
+	ctx := context.Background()
+	service.pollJitter = func() {}
+	hash := uuid.New()
+	if _, err := service.CreateDeposit(ctx, projectID, "poll-down", "lnbc-down", hash[:], 1000, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	service.SetInvoiceReader(&scriptedInvoiceReader{lookupErr: map[string]error{string(hash[:]): errors.New("connection refused")}})
+	if _, err := service.PollPendingDeposits(ctx); err == nil {
+		t.Fatal("poll with every lookup failing = nil, want error so the scheduler retries")
+	}
+	service.SetInvoiceReader(nil)
+	if n, err := service.PollPendingDeposits(ctx); err != nil || n != 0 {
+		t.Fatalf("poll without a reader = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+func settlementLagCount(t *testing.T) uint64 {
+	t.Helper()
+	var metric dto.Metric
+	if err := metrics.DepositSettlementLag.(prometheus.Histogram).Write(&metric); err != nil {
+		t.Fatal(err)
+	}
+	return metric.GetHistogram().GetSampleCount()
 }

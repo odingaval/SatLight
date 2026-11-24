@@ -1,0 +1,2 @@
+# Placeholder so the frontend embed compiles on checkouts without a built UI.
+# The Docker build replaces this directory with the real `vite build` output.

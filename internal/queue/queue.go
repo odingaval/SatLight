@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -16,8 +17,9 @@ type Client struct {
 // NewClient returns an insert-only River client. It registers every job kind
 // (required by River even for inserts) with service-less workers; jobs are
 // executed by the worker binary, never by this client, so Start must never be
-// called on it.
-func NewClient(pool *pgxpool.Pool) *Client {
+// called on it. Construction errors are returned so callers fail startup
+// cleanly with context instead of panicking.
+func NewClient(pool *pgxpool.Pool) (*Client, error) {
 	driver := riverpgxv5.New(pool)
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &ProcessPayoutJob{})
@@ -26,6 +28,8 @@ func NewClient(pool *pgxpool.Pool) *Client {
 	river.AddWorker(workers, &ReconciliationJob{})
 	river.AddWorker(workers, &ClaimExpiryJob{})
 	river.AddWorker(workers, &BountyExpiryJob{})
+	river.AddWorker(workers, &PayoutClaimExpiryJob{})
+	river.AddWorker(workers, &DepositSweepJob{})
 	client, err := river.NewClient(driver, &river.Config{
 		Queues: map[string]river.QueueConfig{
 			river.QueueDefault: {MaxWorkers: 10},
@@ -36,9 +40,9 @@ func NewClient(pool *pgxpool.Pool) *Client {
 		Workers: workers,
 	})
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("create river client: %w", err)
 	}
-	return &Client{Client: client}
+	return &Client{Client: client}, nil
 }
 
 func (c *Client) Insert(ctx context.Context, args river.JobArgs, opts ...river.InsertOpts) error {
@@ -169,4 +173,40 @@ type BountyExpiryJob struct {
 
 func (j *BountyExpiryJob) Work(ctx context.Context, job *river.Job[BountyExpiryArgs]) error {
 	return j.Service.ExpireBounty(ctx, job.Args.BountyID)
+}
+
+type PayoutClaimExpiryArgs struct {
+	PayoutID int64 `json:"payout_id"`
+}
+
+func (PayoutClaimExpiryArgs) Kind() string { return "payout_claim_expiry" }
+
+type PayoutClaimExpirer interface {
+	ExpireClaimLink(ctx context.Context, payoutID int64) error
+}
+
+type PayoutClaimExpiryJob struct {
+	river.WorkerDefaults[PayoutClaimExpiryArgs]
+	Service PayoutClaimExpirer
+}
+
+func (j *PayoutClaimExpiryJob) Work(ctx context.Context, job *river.Job[PayoutClaimExpiryArgs]) error {
+	return j.Service.ExpireClaimLink(ctx, job.Args.PayoutID)
+}
+
+type DepositSweepArgs struct{}
+
+func (DepositSweepArgs) Kind() string { return "deposit_sweep" }
+
+type DepositSweeper interface {
+	RunDepositSweep(ctx context.Context) error
+}
+
+type DepositSweepJob struct {
+	river.WorkerDefaults[DepositSweepArgs]
+	Service DepositSweeper
+}
+
+func (j *DepositSweepJob) Work(ctx context.Context, job *river.Job[DepositSweepArgs]) error {
+	return j.Service.RunDepositSweep(ctx)
 }

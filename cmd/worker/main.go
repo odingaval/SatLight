@@ -64,6 +64,7 @@ func main() {
 	}
 	bountyService := bounty.NewService(cfg, pool)
 	bountyService.SetDependencies(ledgerService, nil)
+	bountyService.SetInvoiceReader(lightningService)
 
 	appID, err := strconv.ParseInt(cfg.GitHubAppID, 10, 64)
 	if err != nil && cfg.GitHubAppID != "" {
@@ -78,7 +79,10 @@ func main() {
 	}, pool)
 
 	notifyService := notify.NewService(cfg, pool)
-	queueClient := queue.NewClient(pool)
+	queueClient, err := queue.NewClient(pool)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to create queue client")
+	}
 	githubService.SetQueue(queueClient)
 	githubService.SetNotifier(notifyService)
 	payoutService := payout.NewService(cfg, pool)
@@ -91,6 +95,8 @@ func main() {
 	river.AddWorker(workers, &queue.ReconciliationJob{Service: ledgerService})
 	river.AddWorker(workers, &queue.ClaimExpiryJob{Service: bountyService})
 	river.AddWorker(workers, &queue.BountyExpiryJob{Service: bountyService})
+	river.AddWorker(workers, &queue.PayoutClaimExpiryJob{Service: payoutService})
+	river.AddWorker(workers, &queue.DepositSweepJob{Service: bountyService})
 
 	driver := riverpgxv5.New(pool)
 	client, err := river.NewClient(driver, &river.Config{
@@ -99,6 +105,13 @@ func main() {
 				river.PeriodicInterval(time.Hour),
 				func() (river.JobArgs, *river.InsertOpts) {
 					return queue.ReconciliationArgs{}, &river.InsertOpts{Queue: "reconciliation"}
+				},
+				&river.PeriodicJobOpts{RunOnStart: true},
+			),
+			river.NewPeriodicJob(
+				river.PeriodicInterval(time.Hour),
+				func() (river.JobArgs, *river.InsertOpts) {
+					return queue.DepositSweepArgs{}, &river.InsertOpts{Queue: "reconciliation"}
 				},
 				&river.PeriodicJobOpts{RunOnStart: true},
 			),

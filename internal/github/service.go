@@ -522,6 +522,24 @@ func (s *Service) VerifyRepoAdmin(ctx context.Context, installationID int64, git
 	return perm.GetPermission() == "admin", nil
 }
 
+// GetRepoLanguage returns the primary language GitHub reports for a repo.
+// Registration metadata only: callers treat failure as unknown, never fatal.
+func (s *Service) GetRepoLanguage(ctx context.Context, installationID int64, repoFullName string) (string, error) {
+	client, err := s.GetInstallationClient(installationID)
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(repoFullName, "/")
+	if len(parts) != 2 {
+		return "", errors.New("invalid repo format")
+	}
+	repo, _, err := client.Repositories.Get(ctx, parts[0], parts[1])
+	if err != nil {
+		return "", err
+	}
+	return repo.GetLanguage(), nil
+}
+
 var oauth2Endpoint = oauth2.Endpoint{
 	AuthURL:  "https://github.com/login/oauth/authorize",
 	TokenURL: "https://github.com/login/oauth/access_token",

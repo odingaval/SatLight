@@ -83,6 +83,15 @@ func testConfig() *config.Config {
 	}
 }
 
+func mustQueueClient(t *testing.T, pool *pgxpool.Pool) *queue.Client {
+	t.Helper()
+	client, err := queue.NewClient(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
 func newPayoutFixture(t *testing.T) *payoutFixture {
 	t.Helper()
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -165,7 +174,7 @@ func newPayoutFixture(t *testing.T) *payoutFixture {
 		lightning: &fakeLightning{}, merge: &fakeMergeVerifier{fresh: true},
 	}
 	svc := NewService(testConfig(), pool)
-	svc.SetDependencies(ledger.NewService(nil, pool), fx.lightning, fx.merge, notify.NewService(testConfig(), pool), queue.NewClient(pool))
+	svc.SetDependencies(ledger.NewService(nil, pool), fx.lightning, fx.merge, notify.NewService(testConfig(), pool), mustQueueClient(t, pool))
 	fx.service = svc
 	return fx
 }
@@ -294,6 +303,39 @@ func TestIntegrationPayoutHappyPath(t *testing.T) {
 	}
 	if f.lightning.sends != 1 {
 		t.Fatalf("lightning sends = %d, want exactly 1", f.lightning.sends)
+	}
+}
+
+func TestIntegrationPayoutSettlesZeroFeeWhenTrackingInconclusive(t *testing.T) {
+	f := newPayoutFixture(t)
+	f.useMockLNURL(t)
+	ctx := context.Background()
+	sentHash := testHash(3)
+	netAmount := f.rewardSats - f.feeSats
+	f.lightning.decodeFunc = func(pr string) (*lnrpc.PayReq, error) {
+		return &lnrpc.PayReq{NumSatoshis: netAmount, PaymentHash: hex.EncodeToString(sentHash)}, nil
+	}
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) { return sentHash, nil }
+	// The send succeeded but tracking reports in-flight with a partial fee:
+	// the payout still settles (funds moved) without booking the partial fee.
+	f.lightning.trackFunc = func(hash []byte) (string, int64, error) { return "IN_FLIGHT", 99, nil }
+
+	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
+		t.Fatal(err)
+	}
+	if status, _, _ := f.payoutRow(t); status != "settled" {
+		t.Fatalf("payout status = %q, want settled", status)
+	}
+	var debits, credits int64
+	if err := f.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount_sats END), 0),
+		       COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount_sats END), 0)
+		FROM ledger_entries WHERE ref_type = 'payout' AND ref_id = $1
+	`, f.bountyID).Scan(&debits, &credits); err != nil {
+		t.Fatal(err)
+	}
+	if debits != credits || debits != f.rewardSats {
+		t.Fatalf("payout ledger debits=%d credits=%d, want balanced %d (zero routing fee)", debits, credits, f.rewardSats)
 	}
 }
 
@@ -455,7 +497,7 @@ func TestIntegrationPayoutRespectsPauseAndCap(t *testing.T) {
 	cappedCfg := testConfig()
 	cappedCfg.DailyPayoutCapSats = 100
 	capped.cfg = cappedCfg
-	capped.SetDependencies(ledger.NewService(nil, f.pool), f.lightning, f.merge, notify.NewService(testConfig(), f.pool), queue.NewClient(f.pool))
+	capped.SetDependencies(ledger.NewService(nil, f.pool), f.lightning, f.merge, notify.NewService(testConfig(), f.pool), mustQueueClient(t, f.pool))
 	if err := capped.ProcessBountyPayout(ctx, f.bountyID); !errors.Is(err, ledger.ErrDailyPayoutCapExceeded) {
 		t.Fatalf("exceeded cap: err=%v, want ErrDailyPayoutCapExceeded", err)
 	}
@@ -487,6 +529,90 @@ func TestIntegrationPayoutDelaysFreshDestination(t *testing.T) {
 	}
 }
 
+func TestIntegrationPayoutDefersInsideGraceWindow(t *testing.T) {
+	f := newPayoutFixture(t)
+	f.service.cfg.PayoutMergeGraceMinutes = 10
+	ctx := context.Background()
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) {
+		t.Fatal("payout inside the grace window must not pay")
+		return nil, nil
+	}
+	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
+		t.Fatal(err)
+	}
+	var payouts int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM payouts WHERE bounty_id = $1`, f.bountyID).Scan(&payouts); err != nil {
+		t.Fatal(err)
+	}
+	if payouts != 0 {
+		t.Fatalf("payouts created = %d, want 0 inside the grace window", payouts)
+	}
+	var mergedAt, scheduledAt time.Time
+	if err := f.pool.QueryRow(ctx, `SELECT merged_at FROM pull_requests WHERE claim_id = (SELECT id FROM claims WHERE bounty_id = $1)`, f.bountyID).Scan(&mergedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.pool.QueryRow(ctx, `SELECT scheduled_at FROM river_job WHERE kind = 'process_payout' AND args->>'bounty_id' = $1 ORDER BY id DESC LIMIT 1`,
+		fmt.Sprint(f.bountyID)).Scan(&scheduledAt); err != nil {
+		t.Fatal(err)
+	}
+	want := mergedAt.Add(10 * time.Minute)
+	if scheduledAt.Before(want.Add(-time.Minute)) || scheduledAt.After(want.Add(time.Minute)) {
+		t.Fatalf("deferred job scheduled at %v, want ~%v", scheduledAt, want)
+	}
+}
+
+func TestIntegrationPayoutPaysAfterGraceWindow(t *testing.T) {
+	f := newPayoutFixture(t)
+	f.useMockLNURL(t)
+	f.service.cfg.PayoutMergeGraceMinutes = 10
+	ctx := context.Background()
+	if _, err := f.pool.Exec(ctx, `UPDATE pull_requests SET merged_at = now() - interval '11 minutes' WHERE claim_id = (SELECT id FROM claims WHERE bounty_id = $1)`, f.bountyID); err != nil {
+		t.Fatal(err)
+	}
+	sentHash := testHash(5)
+	netAmount := f.rewardSats - f.feeSats
+	f.lightning.decodeFunc = func(pr string) (*lnrpc.PayReq, error) {
+		return &lnrpc.PayReq{NumSatoshis: netAmount, PaymentHash: hex.EncodeToString(sentHash)}, nil
+	}
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) { return sentHash, nil }
+	f.lightning.trackFunc = func(hash []byte) (string, int64, error) { return "SUCCEEDED", 2, nil }
+	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
+		t.Fatal(err)
+	}
+	if status, _, _ := f.payoutRow(t); status != "settled" {
+		t.Fatalf("payout status = %q, want settled after the grace window", status)
+	}
+}
+
+func TestIntegrationPayoutRevertInsideWindowIsHeld(t *testing.T) {
+	f := newPayoutFixture(t)
+	f.service.cfg.PayoutMergeGraceMinutes = 10
+	ctx := context.Background()
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) {
+		t.Fatal("reverted payout must not pay")
+		return nil, nil
+	}
+	// First run defers: the merge is seconds old.
+	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
+		t.Fatal(err)
+	}
+	// The revert lands inside the window; the deferred run must hold.
+	f.merge.fresh = false
+	if _, err := f.pool.Exec(ctx, `UPDATE pull_requests SET merged_at = now() - interval '11 minutes' WHERE claim_id = (SELECT id FROM claims WHERE bounty_id = $1)`, f.bountyID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
+		t.Fatal(err)
+	}
+	var payouts int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM payouts WHERE bounty_id = $1`, f.bountyID).Scan(&payouts); err != nil {
+		t.Fatal(err)
+	}
+	if payouts != 0 {
+		t.Fatalf("payouts created = %d, want 0 for a merge reverted inside the window", payouts)
+	}
+}
+
 func TestIntegrationClaimLinkWithdrawFlow(t *testing.T) {
 	f := newPayoutFixture(t)
 	ctx := context.Background()
@@ -498,8 +624,8 @@ func TestIntegrationClaimLinkWithdrawFlow(t *testing.T) {
 	}
 	netAmount := f.rewardSats - f.feeSats
 	if _, err := f.pool.Exec(ctx, `
-		INSERT INTO payouts (bounty_id, user_id, amount_sats, fee_sats, destination, status, attempts, claim_link_token)
-		VALUES ($1, $2, $3, $4, 'contrib@example.test', 'claim_link_issued', 5, $5)
+		INSERT INTO payouts (bounty_id, user_id, amount_sats, fee_sats, destination, status, attempts, claim_link_token, claim_link_expires_at)
+		VALUES ($1, $2, $3, $4, 'contrib@example.test', 'claim_link_issued', 5, $5, now() + interval '30 days')
 	`, f.bountyID, f.contribID, netAmount, f.feeSats, token); err != nil {
 		t.Fatal(err)
 	}
@@ -541,5 +667,128 @@ func TestIntegrationClaimLinkWithdrawFlow(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("decode calls = %d, want 3", calls)
+	}
+}
+
+func TestIntegrationClaimLinkExpiredRejectsRedemption(t *testing.T) {
+	f := newPayoutFixture(t)
+	ctx := context.Background()
+	token, err := newClaimToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	netAmount := f.rewardSats - f.feeSats
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO payouts (bounty_id, user_id, amount_sats, fee_sats, destination, status, attempts, claim_link_token, claim_link_expires_at)
+		VALUES ($1, $2, $3, $4, 'contrib@example.test', 'claim_link_issued', 5, $5, now() - interval '1 hour')
+	`, f.bountyID, f.contribID, netAmount, f.feeSats, token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.GetWithdrawRequest(ctx, token); !errors.Is(err, ErrClaimLinkExpired) {
+		t.Fatalf("GetWithdrawRequest: err=%v, want ErrClaimLinkExpired", err)
+	}
+	f.lightning.decodeFunc = func(pr string) (*lnrpc.PayReq, error) {
+		return &lnrpc.PayReq{NumSatoshis: netAmount, PaymentHash: hex.EncodeToString(testHash(9))}, nil
+	}
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) {
+		t.Fatal("expired link must not pay")
+		return nil, nil
+	}
+	if err := f.service.RedeemClaimLink(ctx, token, "lnbc_anything"); !errors.Is(err, ErrClaimLinkExpired) {
+		t.Fatalf("RedeemClaimLink: err=%v, want ErrClaimLinkExpired", err)
+	}
+	if status, _, _ := f.payoutRow(t); status != "claim_link_issued" {
+		t.Fatalf("payout status = %q, want claim_link_issued (worker has not run)", status)
+	}
+}
+
+func TestIntegrationExpireClaimLinkReturnsFunds(t *testing.T) {
+	f := newPayoutFixture(t)
+	ctx := context.Background()
+	token, err := newClaimToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	netAmount := f.rewardSats - f.feeSats
+	var payoutID int64
+	if err := f.pool.QueryRow(ctx, `
+		INSERT INTO payouts (bounty_id, user_id, amount_sats, fee_sats, destination, status, attempts, claim_link_token, claim_link_expires_at)
+		VALUES ($1, $2, $3, $4, 'contrib@example.test', 'claim_link_issued', 5, $5, now() - interval '1 hour')
+		RETURNING id
+	`, f.bountyID, f.contribID, netAmount, f.feeSats, token).Scan(&payoutID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.ExpireClaimLink(ctx, payoutID); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var linkToken *string
+	if err := f.pool.QueryRow(ctx, `SELECT status, claim_link_token FROM payouts WHERE id = $1`, payoutID).Scan(&status, &linkToken); err != nil {
+		t.Fatal(err)
+	}
+	if status != "expired" || linkToken != nil {
+		t.Fatalf("payout status=%q token set=%t, want expired with cleared token", status, linkToken != nil)
+	}
+	var available, reserved int64
+	if err := f.pool.QueryRow(ctx, `SELECT available_sats, reserved_sats FROM wallets WHERE project_id = $1`, f.projectID).Scan(&available, &reserved); err != nil {
+		t.Fatal(err)
+	}
+	if available != 100000 || reserved != 0 {
+		t.Fatalf("wallet available=%d reserved=%d, want 100000/0 (reward %d returned)", available, reserved, f.rewardSats)
+	}
+	var debits, credits int64
+	if err := f.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount_sats END), 0),
+		       COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount_sats END), 0)
+		FROM ledger_entries WHERE ref_type = 'bounty_refund' AND ref_id = $1
+	`, f.bountyID).Scan(&debits, &credits); err != nil {
+		t.Fatal(err)
+	}
+	if debits != credits || debits != f.rewardSats {
+		t.Fatalf("refund ledger debits=%d credits=%d, want balanced %d", debits, credits, f.rewardSats)
+	}
+	var audits int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE action = 'payout.expired' AND subject = $1`,
+		"bounty:"+fmt.Sprint(f.bountyID)).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 1 {
+		t.Fatalf("payout.expired audit entries = %d, want 1", audits)
+	}
+	var notifications int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM notifications WHERE kind = 'payout_claim_expired' AND ref_id = $1`, f.bountyID).Scan(&notifications); err != nil {
+		t.Fatal(err)
+	}
+	if notifications != 1 {
+		t.Fatalf("payout_claim_expired notifications = %d, want 1", notifications)
+	}
+	if state := f.bountyState(t); state != "payout_failed" {
+		t.Fatalf("bounty state = %q, want payout_failed", state)
+	}
+	var claimStatus string
+	if err := f.pool.QueryRow(ctx, `SELECT status FROM claims WHERE bounty_id = $1`, f.bountyID).Scan(&claimStatus); err != nil {
+		t.Fatal(err)
+	}
+	if claimStatus != "expired" {
+		t.Fatalf("claim status = %q, want expired", claimStatus)
+	}
+	// Second run is a silent no-op: no double refund.
+	if err := f.service.ExpireClaimLink(ctx, payoutID); err != nil {
+		t.Fatal(err)
+	}
+	var refundRows int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM ledger_entries WHERE ref_type = 'bounty_refund' AND ref_id = $1`, f.bountyID).Scan(&refundRows); err != nil {
+		t.Fatal(err)
+	}
+	if refundRows != 2 {
+		t.Fatalf("refund ledger rows = %d, want exactly 2", refundRows)
+	}
+	// The automatic job never revives an expired payout.
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) {
+		t.Fatal("expired payout must not pay")
+		return nil, nil
+	}
+	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
+		t.Fatal(err)
 	}
 }

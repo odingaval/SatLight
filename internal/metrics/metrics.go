@@ -42,4 +42,19 @@ var (
 		Name: "satlight_webhooks_received_total",
 		Help: "Recorded GitHub webhook deliveries by event.",
 	}, []string{"event"})
+
+	// DepositSettlementLag tracks seconds between invoice settlement and
+	// wallet credit for poller- and sweep-discovered deposits.
+	DepositSettlementLag = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "satlight_deposit_settlement_lag_seconds",
+		Help:    "Seconds between invoice settlement and wallet credit for poller- and sweep-discovered deposits.",
+		Buckets: []float64{60, 300, 900, 3600, 21600, 86400},
+	})
+
+	// DepositsReconciled counts deposits recovered outside the settlement
+	// stream, by path: polled, reattached, or quarantined.
+	DepositsReconciled = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "satlight_deposits_reconciled_total",
+		Help: "Deposits recovered outside the settlement stream, by path.",
+	}, []string{"path"})
 )

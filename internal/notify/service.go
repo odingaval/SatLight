@@ -113,10 +113,21 @@ func (s *Service) NotifyPayoutSettled(ctx context.Context, userID, bountyID, amo
 
 func (s *Service) NotifyClaimLink(ctx context.Context, userID, payoutID int64, token string, amountSats int64) error {
 	link := strings.TrimRight(s.cfg.BaseURL, "/") + "/api/v1/payouts/claim/" + token
+	expiryDays := s.cfg.ClaimLinkExpiryDays
+	if expiryDays <= 0 {
+		expiryDays = 30
+	}
 	return s.Notify(ctx, "payout_claim_link", userID, "payout", payoutID,
 		fmt.Sprintf("Claim your %d sats", amountSats),
-		fmt.Sprintf("Automatic payment failed, but your %d sats are reserved.\n\nOpen this link in any Lightning wallet to pull your payment:\n%s\n\nThis link is single-use. Keep it private.\n",
-			amountSats, link))
+		fmt.Sprintf("Automatic payment failed, but your %d sats are reserved.\n\nOpen this link in any Lightning wallet to pull your payment:\n%s\n\nThis link is single-use and expires in %d days; unclaimed funds return to the project wallet. Keep it private.\n",
+			amountSats, link, expiryDays))
+}
+
+func (s *Service) NotifyClaimLinkExpired(ctx context.Context, userID, bountyID, amountSats int64) error {
+	return s.Notify(ctx, "payout_claim_expired", userID, "bounty", bountyID,
+		fmt.Sprintf("Your %d-sat claim link expired", amountSats),
+		fmt.Sprintf("Your claim link for bounty #%d expired unclaimed, so the reserved %d sats returned to the project wallet.\n\nIf you still expect payment, contact the project maintainer about a manual release.\n",
+			bountyID, amountSats))
 }
 
 func (s *Service) NotifyMergeReverted(ctx context.Context, ownerID, bountyID int64) error {

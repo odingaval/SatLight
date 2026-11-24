@@ -3,9 +3,11 @@ package bounty
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -18,8 +20,12 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/satlight/satlight/internal/config"
 	"github.com/satlight/satlight/internal/ledger"
+	"github.com/satlight/satlight/internal/lightning"
+	"github.com/satlight/satlight/internal/metrics"
 	"github.com/satlight/satlight/internal/notify"
 	"github.com/satlight/satlight/internal/queue"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -49,12 +55,21 @@ var (
 )
 
 type Service struct {
-	cfg    *config.Config
-	pool   *pgxpool.Pool
-	log    zerolog.Logger
-	ledger *ledger.Service
-	queue  *queue.Client
-	notify *notify.Service
+	cfg           *config.Config
+	pool          *pgxpool.Pool
+	log           zerolog.Logger
+	ledger        *ledger.Service
+	queue         *queue.Client
+	notify        *notify.Service
+	invoiceReader NodeInvoiceReader
+	pollJitter    func()
+}
+
+// NodeInvoiceReader abstracts the node invoice calls the deposit sweep needs
+// (the Lightning service in production, a scripted fake in tests).
+type NodeInvoiceReader interface {
+	ListSettledInvoices(ctx context.Context) ([]lightning.SettledInvoice, error)
+	LookupInvoice(ctx context.Context, paymentHash []byte) (lightning.InvoiceStatus, error)
 }
 
 func NewService(cfg *config.Config, pool *pgxpool.Pool) *Service {
@@ -65,6 +80,9 @@ func NewService(cfg *config.Config, pool *pgxpool.Pool) *Service {
 		log:    logger,
 		ledger: nil,
 		queue:  nil,
+		// Spread node lookups so a deep backlog does not hammer the node in
+		// lockstep; tests replace this with a no-op.
+		pollJitter: func() { time.Sleep(time.Duration(rand.Int63n(int64(50 * time.Millisecond)))) },
 	}
 }
 
@@ -74,6 +92,10 @@ func (s *Service) SetDependencies(ledger *ledger.Service, queue *queue.Client) {
 }
 
 // SetNotifier wires maintainer-webhook notifications (optional; skipped when nil).
+func (s *Service) SetInvoiceReader(reader NodeInvoiceReader) {
+	s.invoiceReader = reader
+}
+
 func (s *Service) SetNotifier(n *notify.Service) {
 	s.notify = n
 }
@@ -372,7 +394,11 @@ func (s *Service) ListBounties(ctx context.Context, filters ListFilters) ([]*Bou
 	var nextCursor string
 	if len(bounties) > limit {
 		last := bounties[limit-1]
-		nextCursor = encodeBountyCursor(last.CreatedAt, last.ID)
+		if filters.Sort == "reward" {
+			nextCursor = encodeRewardCursor(last.RewardSats, last.ID)
+		} else {
+			nextCursor = encodeBountyCursor(last.CreatedAt, last.ID)
+		}
 		bounties = bounties[:limit]
 	}
 
@@ -394,8 +420,8 @@ func buildListBountiesQuery(filters ListFilters) (string, []interface{}, int, er
 		args = append(args, "%"+filters.Query+"%")
 	}
 	if filters.Language != "" {
-		query += ` AND p.repo_full_name ILIKE ` + placeholder()
-		args = append(args, "%"+filters.Language+"%")
+		query += ` AND p.language ILIKE ` + placeholder()
+		args = append(args, filters.Language)
 	}
 	if filters.Difficulty != "" {
 		query += ` AND b.difficulty = ` + placeholder()
@@ -410,23 +436,40 @@ func buildListBountiesQuery(filters ListFilters) (string, []interface{}, int, er
 		args = append(args, filters.MaxReward)
 	}
 
+	rewardSort := filters.Sort == "reward"
 	if filters.Cursor != "" {
-		cursorTime, cursorID, err := parseBountyCursor(filters.Cursor)
-		if err != nil {
-			return "", nil, 0, err
+		if rewardSort {
+			cursorReward, cursorID, err := parseRewardCursor(filters.Cursor)
+			if err != nil {
+				return "", nil, 0, err
+			}
+			rewardPlaceholder := placeholder()
+			args = append(args, cursorReward)
+			idPlaceholder := placeholder()
+			args = append(args, cursorID)
+			query += ` AND (b.reward_sats, b.id) < (` + rewardPlaceholder + `::bigint, ` + idPlaceholder + `::bigint)`
+		} else {
+			cursorTime, cursorID, err := parseBountyCursor(filters.Cursor)
+			if err != nil {
+				return "", nil, 0, err
+			}
+			timePlaceholder := placeholder()
+			args = append(args, cursorTime)
+			idPlaceholder := placeholder()
+			args = append(args, cursorID)
+			query += ` AND (b.created_at, b.id) < (` + timePlaceholder + `::timestamptz, ` + idPlaceholder + `::bigint)`
 		}
-		timePlaceholder := placeholder()
-		args = append(args, cursorTime)
-		idPlaceholder := placeholder()
-		args = append(args, cursorID)
-		query += ` AND (b.created_at, b.id) < (` + timePlaceholder + `::timestamptz, ` + idPlaceholder + `::bigint)`
 	}
 
 	limit := filters.Limit
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	query += ` ORDER BY b.created_at DESC, b.id DESC LIMIT ` + placeholder()
+	if rewardSort {
+		query += ` ORDER BY b.reward_sats DESC, b.id DESC LIMIT ` + placeholder()
+	} else {
+		query += ` ORDER BY b.created_at DESC, b.id DESC LIMIT ` + placeholder()
+	}
 	args = append(args, limit+1)
 	return query, args, limit, nil
 }
@@ -451,12 +494,40 @@ func encodeBountyCursor(createdAt time.Time, id int64) string {
 	return createdAt.UTC().Format(time.RFC3339Nano) + "|" + strconv.FormatInt(id, 10)
 }
 
+// Reward cursors page the highest-reward sort; the prefix keeps them
+// unambiguous with time cursors. Cursors are sort-specific: a cursor from one
+// sort is invalid under the other.
+func encodeRewardCursor(rewardSats, id int64) string {
+	return "reward:" + strconv.FormatInt(rewardSats, 10) + "|" + strconv.FormatInt(id, 10)
+}
+
+func parseRewardCursor(cursor string) (int64, int64, error) {
+	rest, ok := strings.CutPrefix(cursor, "reward:")
+	if !ok {
+		return 0, 0, ErrInvalidCursor
+	}
+	rawReward, rawID, ok := strings.Cut(rest, "|")
+	if !ok {
+		return 0, 0, ErrInvalidCursor
+	}
+	reward, err := strconv.ParseInt(rawReward, 10, 64)
+	if err != nil || reward < 0 {
+		return 0, 0, ErrInvalidCursor
+	}
+	id, err := strconv.ParseInt(rawID, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, 0, ErrInvalidCursor
+	}
+	return reward, id, nil
+}
+
 type ListFilters struct {
 	Query      string
 	Language   string
 	Difficulty string
 	MinReward  int64
 	MaxReward  int64
+	Sort       string // "newest" (default) or "reward"
 	Cursor     string
 	Limit      int
 }
@@ -1205,6 +1276,28 @@ func (s *Service) CreateDeposit(ctx context.Context, projectID int64, idempotenc
 
 // GetOrCreateDeposit serializes invoice creation for a project idempotency key.
 // The callback runs while holding a PostgreSQL transaction-scoped advisory lock.
+// DepositInvoiceMemo stamps funding invoices with their project so the
+// widowed-invoice sweep can re-attach invoices whose deposit rows were lost
+// (a crash between AddInvoice and commit, or a DB restore from backup).
+func DepositInvoiceMemo(projectID int64) string {
+	return "satlight:project:" + strconv.FormatInt(projectID, 10) + ":deposit"
+}
+
+// ParseDepositInvoiceMemo recovers the project from a funding memo. Memos we
+// did not write (other node users, legacy invoices) are rejected.
+func ParseDepositInvoiceMemo(memo string) (int64, bool) {
+	const prefix = "satlight:project:"
+	const suffix = ":deposit"
+	if len(memo) <= len(prefix)+len(suffix) || !strings.HasPrefix(memo, prefix) || !strings.HasSuffix(memo, suffix) {
+		return 0, false
+	}
+	projectID, err := strconv.ParseInt(memo[len(prefix):len(memo)-len(suffix)], 10, 64)
+	if err != nil || projectID <= 0 {
+		return 0, false
+	}
+	return projectID, true
+}
+
 func (s *Service) GetOrCreateDeposit(ctx context.Context, projectID int64, idempotencyKey string, amountSats int64, createInvoice func(context.Context) (string, []byte, time.Time, error)) (*Deposit, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1401,6 +1494,172 @@ func (s *Service) RecordUnmatchedReceipt(ctx context.Context, paymentHash []byte
 	}
 	s.log.Error().Int64("receipt_id", receiptID).Int64("amount_sats", amountPaidSats).Msg("unmatched Lightning receipt quarantined; staff review required")
 	return nil
+}
+
+// ReconcileWidowedInvoices re-attaches settled node invoices that have no
+// deposit row: invoices with a Satlight deposit memo get their row recreated
+// and credited through the normal settlement path, while anything else
+// settled (keysend, legacy memos, foreign invoices) is quarantined for staff
+// review so no arrival goes unobserved. A nil reader (node never configured)
+// is a silent no-op; node errors fail the run so the scheduler retries.
+func (s *Service) ReconcileWidowedInvoices(ctx context.Context) (int, error) {
+	if s.invoiceReader == nil {
+		return 0, nil
+	}
+	invoices, err := s.invoiceReader.ListSettledInvoices(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var reattached int
+	for _, inv := range invoices {
+		if len(inv.PaymentHash) == 0 || inv.AmountPaidSats <= 0 {
+			continue
+		}
+		var exists bool
+		err := s.pool.QueryRow(ctx, `SELECT true FROM deposits WHERE payment_hash = $1`, inv.PaymentHash).Scan(&exists)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return reattached, err
+		}
+		projectID, ok := ParseDepositInvoiceMemo(inv.Memo)
+		if !ok || inv.Bolt11 == "" {
+			// Not attributable to a project: quarantine for review rather
+			// than crediting blindly. Settled invoices are immutable, so a
+			// replay either matches or fails loudly below.
+			if err := s.RecordUnmatchedReceipt(ctx, inv.PaymentHash, inv.AmountPaidSats); err != nil {
+				return reattached, err
+			}
+			metrics.DepositsReconciled.WithLabelValues("quarantined").Inc()
+			observeSettlementLag(inv.SettledAt)
+			continue
+		}
+		amount := inv.ValueSats
+		if amount <= 0 {
+			amount = inv.AmountPaidSats
+		}
+		var depositID int64
+		err = s.pool.QueryRow(ctx, `
+			INSERT INTO deposits (project_id, bolt11, payment_hash, amount_sats, status, idempotency_key, expires_at)
+			VALUES ($1, $2, $3, $4, 'pending', $5, now())
+			ON CONFLICT (payment_hash) DO NOTHING
+			RETURNING id
+		`, projectID, inv.Bolt11, inv.PaymentHash, amount, "recovered:"+hex.EncodeToString(inv.PaymentHash)).Scan(&depositID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // lost a race with the settlement stream; it owns the row now
+		}
+		if err != nil {
+			return reattached, err
+		}
+		if err := s.SettleDeposit(ctx, inv.PaymentHash, inv.AmountPaidSats); err != nil {
+			return reattached, err
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE unmatched_receipts SET status = 'credited', reviewed_by = 'system-reconciler', reviewed_at = now() WHERE payment_hash = $1 AND status = 'open'`, inv.PaymentHash); err != nil {
+			return reattached, err
+		}
+		if _, err := s.pool.Exec(ctx, `
+			INSERT INTO audit_log (actor, action, subject, metadata)
+			VALUES ('system', 'deposit.reattached', $1, jsonb_build_object('deposit_id', $2::bigint, 'amount_sats', $3::bigint))
+		`, "project:"+strconv.FormatInt(projectID, 10), depositID, inv.AmountPaidSats); err != nil {
+			return reattached, err
+		}
+		reattached++
+		metrics.DepositsReconciled.WithLabelValues("reattached").Inc()
+		observeSettlementLag(inv.SettledAt)
+		s.log.Info().Int64("deposit_id", depositID).Int64("project_id", projectID).Int64("amount_sats", inv.AmountPaidSats).Msg("re-attached widowed deposit invoice")
+	}
+	return reattached, nil
+}
+
+// depositPollBatchSize caps one poll run so an hour of backlog cannot wedge
+// the worker; leftovers wait for the next hourly run.
+const depositPollBatchSize = 500
+
+// PollPendingDeposits backs the invoice subscription: every pending deposit
+// is looked up at the node, settlements the stream missed are credited, and
+// node-canceled invoices expire their rows. Per-invoice failures are logged
+// and skipped so one bad row cannot wedge the batch; if every lookup fails
+// the run errors so the scheduler retries (the node is probably down).
+func (s *Service) PollPendingDeposits(ctx context.Context) (int, error) {
+	if s.invoiceReader == nil {
+		return 0, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT payment_hash FROM deposits WHERE status = 'pending' ORDER BY created_at LIMIT $1`, depositPollBatchSize)
+	if err != nil {
+		return 0, err
+	}
+	var hashes [][]byte
+	for rows.Next() {
+		var hash []byte
+		if err := rows.Scan(&hash); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		hashes = append(hashes, hash)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	var settled, failures int
+	for _, hash := range hashes {
+		if s.pollJitter != nil {
+			s.pollJitter()
+		}
+		invoice, err := s.invoiceReader.LookupInvoice(ctx, hash)
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				s.log.Error().Hex("payment_hash", hash).Msg("pending deposit references an invoice the node never knew; left for staff review")
+				continue
+			}
+			failures++
+			s.log.Error().Err(err).Hex("payment_hash", hash).Msg("deposit poll lookup failed; will retry next run")
+			continue
+		}
+		switch {
+		case invoice.Settled && invoice.PaidSats > 0:
+			if err := s.SettleDeposit(ctx, hash, invoice.PaidSats); err != nil {
+				return settled, err
+			}
+			settled++
+			metrics.DepositsReconciled.WithLabelValues("polled").Inc()
+			observeSettlementLag(invoice.SettledAt)
+		case invoice.Canceled:
+			if err := s.MarkDepositExpired(ctx, hash); err != nil {
+				return settled, err
+			}
+		default:
+			// Still open at the node: leave the row for the stream or the
+			// next poll. Late settlement stays creditable after expiry.
+		}
+	}
+	if len(hashes) > 0 && failures == len(hashes) {
+		return settled, errors.New("all deposit poll lookups failed; node may be down")
+	}
+	return settled, nil
+}
+
+// RunDepositSweep runs both recovery passes: widowed-invoice re-attachment
+// (node state the database never saw) and pending-deposit polling
+// (settlements the stream missed).
+func (s *Service) RunDepositSweep(ctx context.Context) error {
+	if _, err := s.ReconcileWidowedInvoices(ctx); err != nil {
+		return err
+	}
+	_, err := s.PollPendingDeposits(ctx)
+	return err
+}
+
+func observeSettlementLag(settledAt time.Time) {
+	if settledAt.IsZero() {
+		return
+	}
+	if lag := time.Since(settledAt).Seconds(); lag >= 0 {
+		metrics.DepositSettlementLag.Observe(lag)
+	}
 }
 
 // MarkDepositExpired records expiry only after LND reports cancellation.

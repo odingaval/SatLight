@@ -36,6 +36,15 @@ type webhookFixture struct {
 	bountyID          int64
 }
 
+func mustQueueClient(t *testing.T, pool *pgxpool.Pool) *queue.Client {
+	t.Helper()
+	client, err := queue.NewClient(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
 func newWebhookFixture(t *testing.T) *webhookFixture {
 	t.Helper()
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -107,7 +116,7 @@ func newWebhookFixture(t *testing.T) *webhookFixture {
 		t.Fatal(err)
 	}
 	service := NewService(&Config{WebhookSecret: "test"}, pool)
-	service.SetQueue(queue.NewClient(pool))
+	service.SetQueue(mustQueueClient(t, pool))
 	return &webhookFixture{
 		service: service, pool: pool, projectID: projectID,
 		installationID: installationID, repoFullName: repo,

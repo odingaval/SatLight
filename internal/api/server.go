@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -29,6 +30,7 @@ import (
 	"github.com/satlight/satlight/internal/ledger"
 	"github.com/satlight/satlight/internal/lightning"
 	"github.com/satlight/satlight/internal/notify"
+	"github.com/satlight/satlight/internal/ops"
 	"github.com/satlight/satlight/internal/payout"
 	"github.com/satlight/satlight/internal/queue"
 )
@@ -39,6 +41,7 @@ type Server struct {
 	router   *gin.Engine
 	logger   zerolog.Logger
 	services *Services
+	limiter  *rateLimiter
 }
 
 type Services struct {
@@ -50,6 +53,7 @@ type Services struct {
 	Queue     *queue.Client
 	Notify    *notify.Service
 	Payout    *payout.Service
+	Ops       *ops.Service
 }
 
 func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
@@ -78,7 +82,10 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		OAuthClientID:     cfg.GitHubOAuthClientID,
 		OAuthClientSecret: cfg.GitHubOAuthClientSecret,
 	}, pool)
-	queueClient := queue.NewClient(pool)
+	queueClient, err := queue.NewClient(pool)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to create queue client")
+	}
 	notifySvc := notify.NewService(cfg, pool)
 	payoutSvc := payout.NewService(cfg, pool)
 	payoutSvc.SetDependencies(ledgerSvc, lightningSvc, githubSvc, notifySvc, queueClient)
@@ -97,6 +104,7 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		Queue:     queueClient,
 		Notify:    notifySvc,
 		Payout:    payoutSvc,
+		Ops:       ops.NewService(cfg, pool),
 	}
 
 	router := gin.New()
@@ -110,6 +118,7 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		router:   router,
 		logger:   logger,
 		services: services,
+		limiter:  newRateLimiter(),
 	}
 
 	s.setupRoutes()
@@ -192,21 +201,22 @@ func (s *Server) setupRoutes() {
 
 	v1 := s.router.Group("/api/v1")
 	{
-		v1.GET("/auth/github", s.handleGitHubLogin)
-		v1.GET("/auth/github/callback", s.handleGitHubCallback)
-		v1.POST("/waitlist", s.handleWaitlist)
+		v1.GET("/status", s.handleGetStatus)
+		v1.GET("/auth/github", s.rateLimitMiddleware(rateLimitScopeLogin), s.handleGitHubLogin)
+		v1.GET("/auth/github/callback", s.rateLimitMiddleware(rateLimitScopeLogin), s.handleGitHubCallback)
+		v1.POST("/waitlist", s.rateLimitMiddleware(rateLimitScopeWaitlist), s.handleWaitlist)
 
 		v1.GET("/bounties", s.handleListBounties)
 		v1.GET("/bounties/:id", s.handleGetBounty)
-		v1.POST("/bounties/:id/claim", s.authRequired(), s.handleClaimBounty)
-		v1.DELETE("/bounties/:id/claim", s.authRequired(), s.handleReleaseClaim)
+		v1.POST("/bounties/:id/claim", s.authRequired(), s.rateLimitMiddleware(rateLimitScopeClaims), s.handleClaimBounty)
+		v1.DELETE("/bounties/:id/claim", s.authRequired(), s.rateLimitMiddleware(rateLimitScopeClaims), s.handleReleaseClaim)
 		v1.POST("/bounties/:id/cancel", s.authRequired(), s.handleCancelBounty)
 		v1.POST("/bounties/:id/dispute", s.authRequired(), s.handleDisputeBounty)
 		v1.POST("/disputes/:id/resolve", s.authRequired(), s.handleResolveDispute)
 
 		v1.POST("/projects", s.authRequired(), s.handleCreateProject)
 		v1.GET("/projects/:id/wallet", s.authRequired(), s.handleGetWallet)
-		v1.POST("/projects/:id/deposits", s.authRequired(), s.handleCreateDeposit)
+		v1.POST("/projects/:id/deposits", s.authRequired(), s.rateLimitMiddleware(rateLimitScopeDeposits), s.handleCreateDeposit)
 		v1.POST("/projects/:id/withdrawals", s.authRequired(), s.handleCreateWithdrawal)
 		v1.POST("/projects/:id/bounties", s.authRequired(), s.handleCreateBounty)
 		v1.PUT("/projects/:id/notifications", s.authRequired(), s.handleUpdateProjectNotifications)
@@ -220,8 +230,30 @@ func (s *Server) setupRoutes() {
 		v1.GET("/payouts/claim/:token", s.handleRedeemPayoutClaim)
 		v1.GET("/payouts/claim/callback", s.handleWithdrawCallback)
 
-		v1.POST("/webhooks/github", s.handleGitHubWebhook)
+		v1.POST("/webhooks/github", s.rateLimitMiddleware(rateLimitScopeWebhooks), s.handleGitHubWebhook)
 	}
+
+	if s.cfg.ServeStatic {
+		embedded, err := fs.Sub(webDist, "webdist")
+		if err != nil {
+			s.logger.Warn().Err(err).Msg("static frontend is unavailable")
+		} else {
+			registerStaticRoutes(s.router, embedded)
+		}
+	}
+}
+
+// handleGetStatus reports the effective kill-switch state. It is public and
+// unauthenticated so the frontend banner and load balancers can read it; it
+// exposes pause booleans only, never internal reasons.
+func (s *Server) handleGetStatus(c *gin.Context) {
+	status, err := s.services.Ops.Status(c.Request.Context())
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to load platform status")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not load status"}})
+		return
+	}
+	c.JSON(http.StatusOK, status)
 }
 
 func (s *Server) handleGitHubLogin(c *gin.Context) {
@@ -372,6 +404,7 @@ func (s *Server) handleListBounties(c *gin.Context) {
 		Query:      c.Query("q"),
 		Language:   c.Query("language"),
 		Difficulty: c.Query("difficulty"),
+		Sort:       c.Query("sort"),
 		Limit:      20,
 	}
 	if minReward := c.Query("min_reward"); minReward != "" {
@@ -647,6 +680,11 @@ func (s *Server) handleCreateProject(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"code": "FORBIDDEN", "message": "not an admin of the repository"}})
 		return
 	}
+	language, err := s.services.GitHub.GetRepoLanguage(c.Request.Context(), req.InstallationID, req.RepoFullName)
+	if err != nil {
+		s.logger.Warn().Err(err).Str("repo", req.RepoFullName).Msg("could not fetch repository language; registering without it")
+		language = ""
+	}
 
 	var project struct {
 		ID                   int64     `json:"id"`
@@ -656,12 +694,17 @@ func (s *Server) handleCreateProject(c *gin.Context) {
 		Status               string    `json:"status"`
 		CreatedAt            time.Time `json:"created_at"`
 	}
+	var languageAny any
+	if language != "" {
+		languageAny = language
+	}
 	err = s.pool.QueryRow(c.Request.Context(), `
-		INSERT INTO projects (owner_user_id, github_installation_id, repo_full_name)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (repo_full_name) DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id, github_installation_id = EXCLUDED.github_installation_id
+		INSERT INTO projects (owner_user_id, github_installation_id, repo_full_name, language)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (repo_full_name) DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id, github_installation_id = EXCLUDED.github_installation_id,
+			language = COALESCE(EXCLUDED.language, projects.language)
 		RETURNING id, owner_user_id, github_installation_id, repo_full_name, status, created_at
-	`, userID, req.InstallationID, req.RepoFullName).Scan(&project.ID, &project.OwnerUserID, &project.GitHubInstallationID, &project.RepoFullName, &project.Status, &project.CreatedAt)
+	`, userID, req.InstallationID, req.RepoFullName, languageAny).Scan(&project.ID, &project.OwnerUserID, &project.GitHubInstallationID, &project.RepoFullName, &project.Status, &project.CreatedAt)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to create project")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to create project"}})
@@ -792,7 +835,7 @@ func (s *Server) handleCreateDeposit(c *gin.Context) {
 			lightningUnavailable = true
 			return "", nil, time.Time{}, errors.New("lightning invoice service is unavailable")
 		}
-		bolt11, paymentHash, err := s.services.Lightning.CreateInvoice(ctx, req.AmountSats, "Satlight project wallet funding", time.Hour)
+		bolt11, paymentHash, err := s.services.Lightning.CreateInvoice(ctx, req.AmountSats, bounty.DepositInvoiceMemo(project.ID), time.Hour)
 		invoiceCreationErr = err
 		return bolt11, paymentHash, time.Now().Add(time.Hour), err
 	})
@@ -1240,6 +1283,10 @@ func (s *Server) handleRedeemPayoutClaim(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"status": "ERROR", "reason": "unknown or already-used claim link"})
 		return
 	}
+	if errors.Is(err, payout.ErrClaimLinkExpired) {
+		c.JSON(http.StatusNotFound, gin.H{"status": "ERROR", "reason": "claim link expired; the funds returned to the project"})
+		return
+	}
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to load claim link")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "ERROR", "reason": "internal error"})
@@ -1268,6 +1315,8 @@ func (s *Server) handleWithdrawCallback(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "OK"})
 	case errors.Is(err, sql.ErrNoRows) || errors.Is(err, payout.ErrClaimLinkUsed):
 		c.JSON(http.StatusNotFound, gin.H{"status": "ERROR", "reason": "unknown or already-used claim link"})
+	case errors.Is(err, payout.ErrClaimLinkExpired):
+		c.JSON(http.StatusOK, gin.H{"status": "ERROR", "reason": "claim link expired; the funds returned to the project"})
 	case errors.Is(err, payout.ErrInvoiceAmountMismatch):
 		c.JSON(http.StatusOK, gin.H{"status": "ERROR", "reason": err.Error()})
 	default:

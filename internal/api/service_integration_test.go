@@ -595,3 +595,86 @@ func serveFakeSMTP(t *testing.T, listener net.Listener, bodies chan<- string) {
 		}
 	}()
 }
+
+func TestIntegrationAPIRateLimiting(t *testing.T) {
+	f := newAPIFixture(t)
+	limited := *f.cfg
+	limited.RateLimitWaitlistPerMinute = 2
+	limited.RateLimitWaitlistBurst = 2
+	limited.RateLimitClaimsPerMinute = 2
+	limited.RateLimitClaimsBurst = 2
+	router := NewServer(&limited, f.pool).Router()
+
+	// Anonymous waitlist joins share one IP bucket: two pass, the third is
+	// held with a Retry-After header.
+	for i := 0; i < 2; i++ {
+		recorder := doRequest(t, router, "POST", "/api/v1/waitlist",
+			map[string]any{"email": fmt.Sprintf("ratelimit-%d-%d@example.test", time.Now().UnixNano(), i), "role": "contributor"}, nil)
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("waitlist join %d = %d (%s), want 204", i, recorder.Code, recorder.Body.String())
+		}
+	}
+	recorder := doRequest(t, router, "POST", "/api/v1/waitlist",
+		map[string]any{"email": fmt.Sprintf("ratelimit-%d-x@example.test", time.Now().UnixNano()), "role": "contributor"}, nil)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("third waitlist join = %d, want 429", recorder.Code)
+	}
+	if recorder.Header().Get("Retry-After") == "" {
+		t.Fatal("429 is missing the Retry-After header")
+	}
+	if code := decodeBody(t, recorder)["error"].(map[string]any)["code"]; code != "RATE_LIMITED" {
+		t.Fatalf("429 code = %v, want RATE_LIMITED", code)
+	}
+
+	// Authenticated claims are keyed per user: exhausting one user's budget
+	// (against a missing bounty, so no fixture bounty is needed) must not
+	// affect another user from the same IP.
+	userA := f.user(t, "ratelimit-a@example.test")
+	userB := f.user(t, "ratelimit-b@example.test")
+	cookieA := f.cookie(t, userA)
+	cookieB := f.cookie(t, userB)
+	claim := func(cookie *http.Cookie) *httptest.ResponseRecorder {
+		return doRequest(t, router, "POST", "/api/v1/bounties/999999999/claim", nil,
+			map[string]string{"Idempotency-Key": uuid.NewString()}, cookie)
+	}
+	for i := 0; i < 2; i++ {
+		if recorder := claim(cookieA); recorder.Code != http.StatusNotFound {
+			t.Fatalf("user A claim %d = %d, want 404 (missing bounty)", i, recorder.Code)
+		}
+	}
+	if recorder := claim(cookieA); recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("user A third claim = %d, want 429", recorder.Code)
+	}
+	if recorder := claim(cookieB); recorder.Code != http.StatusNotFound {
+		t.Fatalf("user B claim = %d, want 404 (independent budget)", recorder.Code)
+	}
+}
+
+func TestIntegrationAPIStatusReflectsPauseFlags(t *testing.T) {
+	f := newAPIFixture(t)
+	ctx := context.Background()
+
+	recorder := doRequest(t, f.router, "GET", "/api/v1/status", nil, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := decodeBody(t, recorder)
+	if body["funding_paused"] != false || body["outflows_paused"] != false {
+		t.Fatalf("status = %v, want all running (fixture clears flags)", body)
+	}
+	if _, hasMessage := body["message"]; hasMessage {
+		t.Fatalf("running status carries message %q, want none", body["message"])
+	}
+
+	if _, err := f.pool.Exec(ctx, `UPDATE system_flags SET enabled = TRUE WHERE name IN ('funding_paused','outflows_paused')`); err != nil {
+		t.Fatal(err)
+	}
+	recorder = doRequest(t, f.router, "GET", "/api/v1/status", nil, nil)
+	body = decodeBody(t, recorder)
+	if body["funding_paused"] != true || body["outflows_paused"] != true {
+		t.Fatalf("status = %v, want both paused", body)
+	}
+	if body["message"] == nil || body["message"] == "" {
+		t.Fatal("paused status has no user message")
+	}
+}

@@ -104,6 +104,39 @@ func TestBuildListBountiesQueryPlacesCursorBeforeOrderAndLimit(t *testing.T) {
 	}
 }
 
+func TestBuildListBountiesQueryRewardSort(t *testing.T) {
+	cursor := encodeRewardCursor(2500, 7)
+	query, args, _, err := buildListBountiesQuery(ListFilters{Sort: "reward", Language: "Go", Cursor: cursor, Limit: 5})
+	if err != nil {
+		t.Fatalf("buildListBountiesQuery() error = %v", err)
+	}
+	if !strings.Contains(query, "p.language ILIKE $1") {
+		t.Errorf("language filter is not an exact match:\\n%s", query)
+	}
+	if !strings.Contains(query, "AND (b.reward_sats, b.id) < ($2::bigint, $3::bigint)") {
+		t.Errorf("reward cursor clause missing:\\n%s", query)
+	}
+	if !strings.Contains(query, "ORDER BY b.reward_sats DESC, b.id DESC LIMIT $4") {
+		t.Errorf("reward ordering missing:\\n%s", query)
+	}
+	wantArgs := []interface{}{"Go", int64(2500), int64(7), 6}
+	if !reflect.DeepEqual(args, wantArgs) {
+		t.Errorf("query args = %#v, want %#v", args, wantArgs)
+	}
+}
+
+func TestRewardCursorRoundTrip(t *testing.T) {
+	reward, id, err := parseRewardCursor(encodeRewardCursor(2500, 7))
+	if err != nil || reward != 2500 || id != 7 {
+		t.Fatalf("round trip = (%d, %d, %v)", reward, id, err)
+	}
+	for _, bad := range []string{"", "2500|7", "reward:|7", "reward:2500|0", "reward:x|7", encodeBountyCursor(time.Now(), 7)} {
+		if _, _, err := parseRewardCursor(bad); err == nil {
+			t.Errorf("parseRewardCursor(%q) = nil, want error", bad)
+		}
+	}
+}
+
 func TestCanDisputeBounty(t *testing.T) {
 	tests := []struct {
 		state string
@@ -192,6 +225,26 @@ func TestBountyCursorRoundTripAndValidation(t *testing.T) {
 	for _, invalid := range []string{"", "not-a-time|2", "2026-10-23T12:30:00Z|0", "2026-10-23T12:30:00Z|x"} {
 		if _, _, err := parseBountyCursor(invalid); err == nil {
 			t.Errorf("parseBountyCursor(%q) error = nil, want error", invalid)
+		}
+	}
+}
+
+func TestDepositInvoiceMemoRoundTrip(t *testing.T) {
+	for _, projectID := range []int64{1, 12, 987654321} {
+		memo := DepositInvoiceMemo(projectID)
+		got, ok := ParseDepositInvoiceMemo(memo)
+		if !ok || got != projectID {
+			t.Fatalf("Parse(Deposit(%d)) = (%d, %v)", projectID, got, ok)
+		}
+	}
+	for _, foreign := range []string{
+		"", "Satlight project wallet funding", "satlight:project:deposit",
+		"satlight:project:0:deposit", "satlight:project:-3:deposit",
+		"satlight:project:12x:deposit", "satlight:project:12:withdrawal",
+		"xsatlight:project:12:deposit", "satlight:project:12:deposit ",
+	} {
+		if id, ok := ParseDepositInvoiceMemo(foreign); ok {
+			t.Errorf("ParseDepositInvoiceMemo(%q) = (%d, true), want rejected", foreign, id)
 		}
 	}
 }
