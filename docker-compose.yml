@@ -136,14 +136,14 @@ services:
       - LND_HOST=lnd:10009
       - LND_TLS_CERT=/data/tls.cert
       - LND_INVOICE_MACAROON=/data/chain/bitcoin/regtest/invoice.macaroon
-      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/admin.macaroon
+      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/payment.macaroon # bake with scripts/dev-macaroon.sh; never admin
       - PLATFORM_FEE_BPS=200
       - BOUNTY_DEFAULT_EXPIRY_DAYS=90
       - CLAIM_EXPIRY_DAYS=7
       - PAYOUTS_PAUSED=false
       - MIN_REWARD_SATS=500
-      - SESSION_SECRET=dev-session-secret-change-in-production
-      - ENCRYPTION_KEY=dev-encryption-key-change-in-production
+      - SESSION_SECRET=${SESSION_SECRET:?run scripts/dev-init.sh to generate .env secrets}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?run scripts/dev-init.sh to generate .env secrets}
       - LOG_LEVEL=debug
     volumes:
       - lnd_data:/data:ro
@@ -168,7 +168,7 @@ services:
       - LND_HOST=lnd:10009
       - LND_TLS_CERT=/data/tls.cert
       - LND_INVOICE_MACAROON=/data/chain/bitcoin/regtest/invoice.macaroon
-      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/admin.macaroon
+      - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/payment.macaroon # bake with scripts/dev-macaroon.sh; never admin
       - PLATFORM_FEE_BPS=200
       - PAYOUTS_PAUSED=false
       - LOG_LEVEL=debug

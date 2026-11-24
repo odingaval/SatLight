@@ -55,8 +55,9 @@ Thousands of small but valuable contributions (docs fixes, minor bugs, tests, tr
 git clone https://github.com/<org>/satlight.git
 cd satlight
 
-cp .env.example .env        # fill in values; never commit real secrets
+./scripts/dev-init.sh     # generate per-checkout secrets into .env (gitignored)
 make dev                    # API + workers + Postgres + regtest bitcoind + 2 LND nodes
+./scripts/dev-macaroon.sh   # bake the constrained payment macaroon, then restart api/worker
 make seed                   # load sample projects and bounties
 ```
 
@@ -86,6 +87,16 @@ make build       # build binaries
 
 - Use regtest with two LND nodes (via `docker compose` or [Polar](https://lightningpolar.com)) to open channels and simulate deposits and payouts.
 - Use recorded webhook fixtures in `testdata/github/` for offline work, or a tunnel (smee.io, ngrok) for live webhooks from a test GitHub App.
+
+## Deploying
+
+`render.yaml` deploys the API, worker, and Postgres to Render as one service
+(one public URL serves the UI and `/api/*`, so sign-in cookies stay
+same-origin). Dashboard → New → Blueprint, then fill the manual values:
+`SESSION_SECRET`/`ENCRYPTION_KEY` on the worker (same as web), the GitHub App
+credentials for a second App whose callback is
+`<service URL>/api/v1/auth/github/callback`, and `LND_*` once a node exists
+(funding endpoints answer 503 until then). Signet/testnet only.
 
 ## Configuration
 

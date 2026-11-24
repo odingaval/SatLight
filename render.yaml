@@ -1,0 +1,74 @@
+# Render blueprint: single-origin deploy (one public URL serves the UI and /api/*).
+# Deploy via Dashboard -> New -> Blueprint, then fill the `sync: false` values.
+# Signet/testnet only: never point a deploy at mainnet funds you cannot lose.
+services:
+  - type: web
+    name: satlight-api
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    dockerCommand: /app/satlight-api
+    preDeployCommand: /app/satlight-migrate -dir=up
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: NETWORK
+        value: signet
+      - key: SERVE_STATIC
+        value: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: satlight-db
+          property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      # Public URL defaults to RENDER_EXTERNAL_URL; set these only for a custom domain.
+      - key: BASE_URL
+        sync: false
+      - key: WEB_URL
+        sync: false
+      # Second GitHub App (deployed callback: <service URL>/api/v1/auth/github/callback).
+      - key: GITHUB_APP_ID
+        sync: false
+      - key: GITHUB_APP_PRIVATE_KEY_PATH
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      - key: GITHUB_OAUTH_CLIENT_ID
+        sync: false
+      - key: GITHUB_OAUTH_CLIENT_SECRET
+        sync: false
+      # Leave empty until the Lightning node exists; funding endpoints answer 503 meanwhile.
+      - key: LND_HOST
+        sync: false
+      - key: LND_TLS_CERT
+        sync: false
+      - key: LND_INVOICE_MACAROON
+        sync: false
+      - key: LND_PAYMENT_MACAROON
+        sync: false
+  - type: worker
+    name: satlight-worker
+    runtime: docker
+    plan: starter
+    dockerCommand: /app/satlight-worker
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: NETWORK
+        value: signet
+      - key: DATABASE_URL
+        fromDatabase:
+          name: satlight-db
+          property: connectionString
+      # Paste the same values as the web service (config requires them set).
+      - key: SESSION_SECRET
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+
+databases:
+  - name: satlight-db
+    plan: starter
