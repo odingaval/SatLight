@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/satlight/satlight/internal/lightning"
 	"github.com/riverqueue/river/rivermigrate"
 	"github.com/satlight/satlight/internal/config"
 	"github.com/satlight/satlight/internal/ledger"
@@ -409,6 +410,118 @@ func TestIntegrationPayoutFailuresBackOffThenClaimLink(t *testing.T) {
 	}
 	if state := f.bountyState(t); state != "merged" {
 		t.Fatalf("bounty state = %q, want merged (funds still reserved)", state)
+	}
+}
+
+func TestIntegrationPayoutTimeoutSettlesWhenHashSucceeded(t *testing.T) {
+	f := newPayoutFixture(t)
+	f.useMockLNURL(t)
+	ctx := context.Background()
+	netAmount := f.rewardSats - f.feeSats
+	f.lightning.decodeFunc = func(pr string) (*lnrpc.PayReq, error) {
+		return &lnrpc.PayReq{NumSatoshis: netAmount, PaymentHash: hex.EncodeToString(testHash(11))}, nil
+	}
+	// The client gave up waiting, but the payment landed server-side: the
+	// hash check must settle instead of burning an attempt.
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) {
+		return nil, lightning.ErrPaymentTimedOut
+	}
+	f.lightning.trackFunc = func(hash []byte) (string, int64, error) { return "SUCCEEDED", 3, nil }
+	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
+		t.Fatal(err)
+	}
+	if status, _, _ := f.payoutRow(t); status != "settled" {
+		t.Fatalf("payout status = %q, want settled", status)
+	}
+	if state := f.bountyState(t); state != "paid" {
+		t.Fatalf("bounty state = %q, want paid", state)
+	}
+}
+
+func TestIntegrationPayoutTimeoutRetriesWhenInflight(t *testing.T) {
+	f := newPayoutFixture(t)
+	f.useMockLNURL(t)
+	ctx := context.Background()
+	netAmount := f.rewardSats - f.feeSats
+	f.lightning.decodeFunc = func(pr string) (*lnrpc.PayReq, error) {
+		return &lnrpc.PayReq{NumSatoshis: netAmount, PaymentHash: hex.EncodeToString(testHash(12))}, nil
+	}
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) {
+		return nil, lightning.ErrPaymentTimedOut
+	}
+	f.lightning.trackFunc = func(hash []byte) (string, int64, error) { return "IN_FLIGHT", 0, nil }
+	// No attempt is burned: the returned error retries the job, and the
+	// top-of-run hash check re-verifies before any new send.
+	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err == nil {
+		t.Fatal("ProcessBountyPayout() = nil, want an in-flight retry error")
+	}
+	status, attempts, _ := f.payoutRow(t)
+	if status != "sending" || attempts != 0 {
+		t.Fatalf("status=%q attempts=%d, want sending/0", status, attempts)
+	}
+	var jobs int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM river_job WHERE kind = 'process_payout' AND args->>'bounty_id' = $1`,
+		fmt.Sprint(f.bountyID)).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 0 {
+		t.Fatalf("scheduled retry jobs = %d, want 0 (the job error retries instead)", jobs)
+	}
+}
+
+func TestIntegrationPayoutTimeoutFailsWhenHashFailed(t *testing.T) {
+	f := newPayoutFixture(t)
+	f.useMockLNURL(t)
+	ctx := context.Background()
+	netAmount := f.rewardSats - f.feeSats
+	f.lightning.decodeFunc = func(pr string) (*lnrpc.PayReq, error) {
+		return &lnrpc.PayReq{NumSatoshis: netAmount, PaymentHash: hex.EncodeToString(testHash(13))}, nil
+	}
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) {
+		return nil, lightning.ErrPaymentTimedOut
+	}
+	f.lightning.trackFunc = func(hash []byte) (string, int64, error) { return "FAILED", 0, nil }
+	if err := f.service.ProcessBountyPayout(ctx, f.bountyID); err != nil {
+		t.Fatal(err)
+	}
+	status, attempts, _ := f.payoutRow(t)
+	if status != "failed" || attempts != 1 {
+		t.Fatalf("status=%q attempts=%d, want failed/1", status, attempts)
+	}
+}
+
+func TestIntegrationClaimLinkTimeoutSettlesWhenHashSucceeded(t *testing.T) {
+	f := newPayoutFixture(t)
+	ctx := context.Background()
+	token, err := newClaimToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	netAmount := f.rewardSats - f.feeSats
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO payouts (bounty_id, user_id, amount_sats, fee_sats, destination, status, attempts, claim_link_token, claim_link_expires_at)
+		VALUES ($1, $2, $3, $4, 'contrib@example.test', 'claim_link_issued', 5, $5, now() + interval '30 days')
+	`, f.bountyID, f.contribID, netAmount, f.feeSats, token); err != nil {
+		t.Fatal(err)
+	}
+	sentHash := testHash(14)
+	f.lightning.decodeFunc = func(pr string) (*lnrpc.PayReq, error) {
+		return &lnrpc.PayReq{NumSatoshis: netAmount, PaymentHash: hex.EncodeToString(sentHash)}, nil
+	}
+	f.lightning.payFunc = func(invoice string, maxFee int64) ([]byte, error) {
+		return nil, lightning.ErrPaymentTimedOut
+	}
+	f.lightning.trackFunc = func(hash []byte) (string, int64, error) { return "SUCCEEDED", 1, nil }
+	// Settle, not "link stays usable": the money moved, so a reusable link
+	// would pay twice.
+	if err := f.service.RedeemClaimLink(ctx, token, "lnbc_correct"); err != nil {
+		t.Fatal(err)
+	}
+	if status, _, _ := f.payoutRow(t); status != "claimed_via_link" {
+		t.Fatalf("payout status = %q, want claimed_via_link", status)
+	}
+	if state := f.bountyState(t); state != "paid" {
+		t.Fatalf("bounty state = %q, want paid", state)
 	}
 }
 

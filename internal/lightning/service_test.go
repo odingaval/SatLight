@@ -2,6 +2,7 @@ package lightning
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -163,5 +164,69 @@ func TestGetPaymentResultEOFWithoutTerminal(t *testing.T) {
 	status, fee, err := svc.GetPaymentResult(context.Background(), []byte("hash"))
 	if err != nil || status != "unknown" || fee != 0 {
 		t.Fatalf("GetPaymentResult() = %q, %d, %v; want unknown, 0, nil", status, fee, err)
+	}
+}
+
+// fakePayClient scripts DecodePayReq; the embedded nil interface keeps the
+// fake small since only DecodePayReq is exercised.
+type fakePayClient struct {
+	lnrpc.LightningClient
+	payReq *lnrpc.PayReq
+}
+
+func (f *fakePayClient) DecodePayReq(context.Context, *lnrpc.PayReqString, ...grpc.CallOption) (*lnrpc.PayReq, error) {
+	return f.payReq, nil
+}
+
+func (f *fakeRouter) SendPaymentV2(ctx context.Context, _ *routerrpc.SendPaymentRequest, _ ...grpc.CallOption) (routerrpc.Router_SendPaymentV2Client, error) {
+	f.stream.ctx = ctx
+	return f.stream, nil
+}
+
+func payTestService(router *fakeRouter) *Service {
+	return &Service{
+		paymentClient: &fakePayClient{payReq: &lnrpc.PayReq{NumSatoshis: 1000}},
+		routerClient:  router,
+		sendTimeout:   50 * time.Millisecond,
+	}
+}
+
+func TestPayInvoiceSendTimeout(t *testing.T) {
+	router := &fakeRouter{stream: &fakeTrackStream{block: true}}
+	svc := payTestService(router)
+	start := time.Now()
+	hash, err := svc.PayInvoice(context.Background(), "lnbc10mock", 100)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("PayInvoice() blocked %v, want a bounded wait", elapsed)
+	}
+	if !errors.Is(err, ErrPaymentTimedOut) {
+		t.Fatalf("PayInvoice() = %x, %v; want nil, ErrPaymentTimedOut", hash, err)
+	}
+}
+
+func TestPayInvoiceSuccess(t *testing.T) {
+	router := &fakeRouter{stream: &fakeTrackStream{msgs: []*lnrpc.Payment{
+		{Status: lnrpc.Payment_IN_FLIGHT},
+		{Status: lnrpc.Payment_SUCCEEDED, PaymentHash: "ab12"},
+	}}}
+	svc := payTestService(router)
+	hash, err := svc.PayInvoice(context.Background(), "lnbc10mock", 100)
+	if err != nil {
+		t.Fatalf("PayInvoice() error = %v, want nil", err)
+	}
+	if len(hash) != 2 || hash[0] != 0xab || hash[1] != 0x12 {
+		t.Fatalf("PayInvoice() hash = %x, want ab12", hash)
+	}
+}
+
+func TestPayInvoiceFailedIsDefinitive(t *testing.T) {
+	router := &fakeRouter{stream: &fakeTrackStream{msgs: []*lnrpc.Payment{
+		{Status: lnrpc.Payment_FAILED, FailureReason: lnrpc.PaymentFailureReason_FAILURE_REASON_NO_ROUTE},
+	}}}
+	svc := payTestService(router)
+	if _, err := svc.PayInvoice(context.Background(), "lnbc10mock", 100); err == nil {
+		t.Fatal("PayInvoice() = nil, want a no-route failure")
+	} else if errors.Is(err, ErrPaymentTimedOut) {
+		t.Fatalf("PayInvoice() error = %v, want a definitive failure, not a timeout", err)
 	}
 }

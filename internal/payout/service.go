@@ -25,6 +25,7 @@ import (
 	"github.com/satlight/satlight/internal/bounty"
 	"github.com/satlight/satlight/internal/config"
 	"github.com/satlight/satlight/internal/ledger"
+	"github.com/satlight/satlight/internal/lightning"
 	"github.com/satlight/satlight/internal/metrics"
 	"github.com/satlight/satlight/internal/notify"
 	"github.com/satlight/satlight/internal/queue"
@@ -465,6 +466,9 @@ func (s *Service) ProcessBountyPayout(ctx context.Context, bountyID int64) error
 	}
 	sentHash, err := s.lightning.PayInvoice(ctx, invoice, s.maxRoutingFeeSats(netAmount))
 	if err != nil {
+		if errors.Is(err, lightning.ErrPaymentTimedOut) {
+			return s.resolveTimedOutSend(ctx, pctx, payoutID, invHash, err)
+		}
 		return s.recordSendFailure(ctx, pctx, err.Error())
 	}
 	status, fee, trackErr := s.lightning.GetPaymentResult(ctx, sentHash)
@@ -476,6 +480,33 @@ func (s *Service) ProcessBountyPayout(ctx context.Context, bountyID int64) error
 		fee = 0
 	}
 	return s.settlePayout(ctx, payoutID, sentHash, fee, "settled")
+}
+
+// resolveTimedOutSend settles the books after a send whose outcome is
+// unknown: the client gave up waiting, but the payment may still settle
+// server-side. The hash decides: succeeded payments settle, in-flight or
+// unverifiable ones return an error without burning an attempt (the River
+// job retries and the top-of-run check re-verifies), and only a definitive
+// FAILED joins the normal failure path — recordSendFailure must never issue
+// a claim link while a payment could still land.
+func (s *Service) resolveTimedOutSend(ctx context.Context, pctx *payoutContext, payoutID int64, paymentHash []byte, sendErr error) error {
+	status, fee, err := s.lightning.GetPaymentResult(ctx, paymentHash)
+	if err != nil {
+		s.log.Warn().Int64("bounty_id", pctx.bountyID).Err(err).Msg("timed-out send is unverifiable; will retry without burning an attempt")
+		return fmt.Errorf("timed-out payout for bounty %d is unverifiable: %w", pctx.bountyID, err)
+	}
+	switch status {
+	case "SUCCEEDED":
+		s.log.Info().Int64("bounty_id", pctx.bountyID).Msg("timed-out send had actually succeeded; settling")
+		return s.settlePayout(ctx, payoutID, paymentHash, fee, "settled")
+	case "IN_FLIGHT":
+		return fmt.Errorf("timed-out payout for bounty %d still in flight; will retry", pctx.bountyID)
+	case "FAILED":
+		return s.recordSendFailure(ctx, pctx, "send timed out and the payment failed: "+sendErr.Error())
+	default:
+		s.log.Warn().Int64("bounty_id", pctx.bountyID).Str("status", status).Msg("timed-out send has an unexpected status; will retry without burning an attempt")
+		return fmt.Errorf("timed-out payout for bounty %d has status %q; will retry", pctx.bountyID, status)
+	}
 }
 
 // deferForMergeGraceWindow holds payouts inside the force-revert grace window
@@ -822,6 +853,9 @@ func (s *Service) RedeemClaimLink(ctx context.Context, token, bolt11 string) err
 	}
 	sentHash, err := s.lightning.PayInvoice(ctx, bolt11, s.maxRoutingFeeSats(amountSats))
 	if err != nil {
+		if errors.Is(err, lightning.ErrPaymentTimedOut) {
+			return s.resolveTimedOutRedemption(ctx, payoutID, hash, err)
+		}
 		_, _ = s.pool.Exec(ctx, `UPDATE payouts SET status = 'claim_link_issued', last_error = $1 WHERE id = $2`, err.Error(), payoutID)
 		return err
 	}
@@ -834,6 +868,29 @@ func (s *Service) RedeemClaimLink(ctx context.Context, token, bolt11 string) err
 		fee = 0
 	}
 	return s.settlePayout(ctx, payoutID, sentHash, fee, "claimed_via_link")
+}
+
+// resolveTimedOutRedemption settles a claim-link redemption whose send timed
+// out. A hash that actually succeeded settles immediately — leaving the link
+// usable after the money moved would let the wallet redeem a second time.
+// Anything else keeps the existing behavior: the link stays usable with the
+// outcome recorded. (Residual risk, shared with stream-error failures: a
+// retry pays a fresh invoice while the timed-out payment may still be in
+// flight. Closing that needs the redemption hash re-checked on the next
+// redemption attempt.)
+func (s *Service) resolveTimedOutRedemption(ctx context.Context, payoutID int64, paymentHash []byte, sendErr error) error {
+	status, fee, err := s.lightning.GetPaymentResult(ctx, paymentHash)
+	if err == nil && status == "SUCCEEDED" {
+		s.log.Info().Int64("payout_id", payoutID).Msg("timed-out redemption had actually succeeded; settling")
+		return s.settlePayout(ctx, payoutID, paymentHash, fee, "claimed_via_link")
+	}
+	outcome := status
+	if err != nil {
+		outcome = "lookup failed: " + err.Error()
+	}
+	_, _ = s.pool.Exec(ctx, `UPDATE payouts SET status = 'claim_link_issued', last_error = $1 WHERE id = $2`,
+		fmt.Sprintf("send timed out (%v); payment %s", sendErr, outcome), payoutID)
+	return sendErr
 }
 
 // ExpireClaimLink runs when a claim link passes its expiry: the link dies,

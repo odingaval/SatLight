@@ -26,6 +26,10 @@ var (
 	ErrInvoiceExpired = errors.New("invoice expired")
 	ErrPaymentFailed  = errors.New("payment failed")
 	ErrNodeUnhealthy  = errors.New("lightning node unhealthy")
+	// ErrPaymentTimedOut reports a send the client gave up waiting for. The
+	// payment may still settle server-side, so callers must check the
+	// outcome by hash before retrying or releasing funds another way.
+	ErrPaymentTimedOut = errors.New("payment send timed out with unknown outcome")
 )
 
 type Service struct {
@@ -44,12 +48,23 @@ type Service struct {
 	// trackTimeout bounds how long GetPaymentResult waits for a terminal
 	// payment update. Tests override it; production uses the default below.
 	trackTimeout time.Duration
+	// sendTimeout bounds the whole PayInvoice call. Tests override it;
+	// production uses the default below.
+	sendTimeout time.Duration
 }
 
 // defaultTrackTimeout bounds payment-status waits. Terminal payments answer
 // immediately (LND replays the current state on subscribe); only genuinely
 // in-flight payments wait out the clock.
 const defaultTrackTimeout = 30 * time.Second
+
+// defaultSendTimeout bounds payment sends. It must exceed the TimeoutSeconds
+// asked of LND so the node's own deadline fires first when it works — but it
+// cannot be omitted: LND v0.21.4 demonstrably leaves SendPaymentV2 streams
+// open past any TimeoutSeconds when the only peer disconnects (observed: a
+// 10-minute wedged stream in the regtest suite), which would wedge the
+// payout worker the same way.
+const defaultSendTimeout = 90 * time.Second
 
 type Config struct {
 	Host            string
@@ -68,6 +83,7 @@ func NewService(cfg interface{}, pool *pgxpool.Pool) *Service {
 		pool:         pool,
 		log:          logger,
 		trackTimeout: defaultTrackTimeout,
+		sendTimeout:  defaultSendTimeout,
 	}
 }
 
@@ -284,9 +300,23 @@ func (s *Service) PayInvoice(ctx context.Context, invoice string, maxFeeSats int
 	if s.paymentClient == nil || s.routerClient == nil {
 		return nil, ErrNodeUnhealthy
 	}
+	timeout := s.sendTimeout
+	if timeout <= 0 {
+		timeout = defaultSendTimeout
+	}
+	sendCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// timedOut reports our own deadline firing, as opposed to the caller
+	// going away (whose error passes through unchanged).
+	timedOut := func() bool { return sendCtx.Err() != nil && ctx.Err() == nil }
+	timeoutErr := func() error { return fmt.Errorf("send payment: %w", ErrPaymentTimedOut) }
+
 	// Parse the invoice to get the amount and destination
-	payReq, err := s.paymentClient.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: invoice})
+	payReq, err := s.paymentClient.DecodePayReq(sendCtx, &lnrpc.PayReqString{PayReq: invoice})
 	if err != nil {
+		if timedOut() {
+			return nil, timeoutErr()
+		}
 		return nil, err
 	}
 	if payReq.NumSatoshis <= 0 {
@@ -296,12 +326,15 @@ func (s *Service) PayInvoice(ctx context.Context, invoice string, maxFeeSats int
 	// Use router's SendPaymentV2 for sending payments. Amt stays unset:
 	// every invoice we pay carries its own amount, and LND rejects an
 	// explicit amount on fixed-amount invoices.
-	stream, err := s.routerClient.SendPaymentV2(ctx, &routerrpc.SendPaymentRequest{
+	stream, err := s.routerClient.SendPaymentV2(sendCtx, &routerrpc.SendPaymentRequest{
 		PaymentRequest: invoice,
 		FeeLimitSat:    maxFeeSats,
 		TimeoutSeconds: 60,
 	})
 	if err != nil {
+		if timedOut() {
+			return nil, timeoutErr()
+		}
 		return nil, err
 	}
 
@@ -309,9 +342,15 @@ func (s *Service) PayInvoice(ctx context.Context, invoice string, maxFeeSats int
 	for {
 		payment, err := stream.Recv()
 		if err == io.EOF {
+			if timedOut() {
+				return nil, timeoutErr()
+			}
 			break
 		}
 		if err != nil {
+			if timedOut() {
+				return nil, timeoutErr()
+			}
 			return nil, err
 		}
 		if payment.Status == lnrpc.Payment_SUCCEEDED {

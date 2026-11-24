@@ -49,6 +49,7 @@ Never use the admin macaroon for app traffic: it can spend, close channels, and 
 ## Rules
 - **Persist before pay.** The attempt and payment hash are committed before sending.
 - **Unknown outcome is not failure.** On timeout or crash, call `LookupPayment` by hash; only retry if the previous attempt is definitively failed.
+- **Bound the send client-side.** `PayInvoice` enforces a 90s deadline on top of LND's `TimeoutSeconds`, which v0.21.4 does not honor when the only peer disconnects. Timeouts return `ErrPaymentTimedOut`; the payout layer then checks the hash (settle if succeeded, hold if in-flight, fail only on definitive `FAILED`) so attempts and claim links are never spent on a payment that may still settle.
 - **One payout per bounty** is enforced by a unique constraint.
 - **Fee limit:** max(10 sats, 1% of amount) by default (`PAYOUT_MAX_FEE_*`).
 - **Retry schedule:** 1m, 5m, 30m, 2h, 12h. Then issue an LNURL-withdraw claim link (`payouts.claim_link_token`) and email the contributor. Claim links expire after 30 days; unclaimed funds return to the project wallet after notice.
