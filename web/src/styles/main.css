@@ -503,6 +503,9 @@ tr:hover td {
 
 body { background: var(--cream); color: var(--ink); }
 .site-header { position: relative; z-index: 5; background: var(--cream); }
+.pause-banner { padding: .55rem 1rem; background: #f5c518; color: #3a3000; font-size: .75rem; text-align: center; }
+.qr-code { display: flex; justify-content: center; margin: .9rem 0; }
+.qr-code svg { width: min(240px, 100%); height: auto; border-radius: 8px; background: #fff; }
 .site-header .nav { min-height: 78px; border-bottom: 1px solid rgba(23,34,31,.11); }
 .nav-brand { display: inline-flex; align-items: center; gap: .55rem; color: var(--ink); font-size: 1.2rem; letter-spacing: -.06em; font-weight: 750; }
 .brand-mark { display: block; width: 29px; height: 29px; flex: 0 0 29px; border-radius: 50%; background: url('/satlight-icon.png') center / contain no-repeat; }

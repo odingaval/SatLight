@@ -1,3 +1,5 @@
+import qrcode from 'qrcode-generator'
+
 type Bounty = { id: number; project_id: number; repo_full_name: string; github_issue_number: number; title: string; description: string; difficulty: string; reward_sats: number; net_payout_sats: number; state: string }
 type Claim = { id: number; bounty_id: number; status: string; expires_at: string; title: string; reward_sats: number; bounty_state: string; repo_full_name: string }
 type Payout = { id: number; bounty_id: number; amount_sats: number; fee_sats: number; status: string; settled_at: string | null; title: string; repo_full_name: string; claim_link_token?: string }
@@ -10,6 +12,20 @@ const escapeHtml = (value: string) => {
 }
 const formatSats = (value: number) => new Intl.NumberFormat().format(value)
 const formatBTC = (sats: number) => (sats / 100_000_000).toFixed(8).replace(/\.?0+$/, '') || '0'
+
+// qrSvg renders a scannable invoice QR. The svg is generated markup (encoded
+// modules, not interpolated text), so it is safe to inject. Failures fall
+// back to the copyable text alone.
+const qrSvg = (bolt11: string) => {
+  try {
+    const qr = qrcode(0, 'M')
+    qr.addData(`lightning:${bolt11}`)
+    qr.make()
+    return `<div class="qr-code" role="img" aria-label="Lightning invoice QR code">${qr.createSvgTag({ scalable: true })}</div>`
+  } catch {
+    return ''
+  }
+}
 const header = `<header class="site-header"><div class="container nav"><a class="nav-brand" href="/"><span class="brand-mark" aria-hidden="true"></span> satlight</a><nav class="nav-links"><a class="nav-link" href="/bounties">Browse bounties</a><a class="nav-link" href="/my-work">My work</a><a class="nav-link" href="/settings">Settings</a><a class="btn btn-dark nav-cta" href="/#register">Register a project ↗</a></nav></div></header>`
 
 export function renderExtraPage(app: HTMLDivElement, path: string) {
@@ -33,7 +49,7 @@ function renderBrowse(app: HTMLDivElement) {
   let timer = 0
   const load = async () => {
     const params = new URLSearchParams()
-    new FormData(form).forEach((value, key) => { if (value && key !== 'sort') params.set(key, String(value)) })
+    new FormData(form).forEach((value, key) => { if (value) params.set(key, String(value)) })
     params.set('limit', '60')
     results.innerHTML = '<p class="market-state">Finding open bounties…</p>'
     try {
@@ -41,7 +57,6 @@ function renderBrowse(app: HTMLDivElement) {
       if (!response.ok) throw new Error('Bounties are temporarily unavailable.')
       const data = await response.json() as { items?: Bounty[] }
       const items = data.items ?? []
-      if ((form.elements.namedItem('sort') as HTMLSelectElement).value === 'reward') items.sort((a, b) => b.reward_sats - a.reward_sats)
       count.textContent = `${items.length} ${items.length === 1 ? 'bounty' : 'bounties'}`
       results.innerHTML = items.length ? items.map((b) => `<article class="market-card"><div class="market-card-meta"><span class="state-dot">● ${escapeHtml(b.state)}</span><span>#${b.github_issue_number}</span></div><a class="market-repo" href="https://github.com/${encodeURIComponent(b.repo_full_name).replace(/%2F/g, '/')}">${escapeHtml(b.repo_full_name)}</a><h2><a href="/bounties/${b.id}">${escapeHtml(b.title)}</a></h2><p>${escapeHtml(b.description.slice(0, 150))}${b.description.length > 150 ? '…' : ''}</p><div class="market-tags"><span>${escapeHtml(b.difficulty)}</span></div><div class="market-card-foot"><strong>⚡ ${formatSats(b.reward_sats)} <small>sats</small></strong><a class="btn btn-dark" href="/bounties/${b.id}">View bounty →</a></div></article>`).join('') : '<div class="market-empty"><span>✳</span><h2>No open bounties yet</h2><p>Try a different search, or check back soon as maintainers add new work.</p></div>'
     } catch (error) { count.textContent = ''; results.innerHTML = `<p class="market-state is-error">${escapeHtml(error instanceof Error ? error.message : 'Could not load bounties.')}</p>` }
@@ -118,7 +133,7 @@ async function renderDashboard(app: HTMLDivElement, projectId: string, preview =
       if (data.bolt11) {
         const invoicePanel = document.querySelector<HTMLDivElement>('#qr-invoice')!
         invoicePanel.classList.add('has-invoice')
-        invoicePanel.innerHTML = `<strong>Lightning invoice ready</strong><code>${escapeHtml(data.bolt11)}</code><button type="button" class="copy-invoice">Copy invoice</button>`
+        invoicePanel.innerHTML = `<strong>Lightning invoice ready</strong>${qrSvg(data.bolt11)}<code>${escapeHtml(data.bolt11)}</code><button type="button" class="copy-invoice">Copy invoice</button>`
         invoicePanel.querySelector<HTMLButtonElement>('.copy-invoice')!.addEventListener('click', async () => {
           try { await navigator.clipboard.writeText(data.bolt11!); message.textContent = 'Invoice copied to clipboard.'; message.className = 'dashboard-message is-success' }
           catch { message.textContent = 'Copy unavailable. Select the invoice text to copy it.'; message.className = 'dashboard-message' }

@@ -172,3 +172,19 @@ fetch('/api/v1/me').then(async (response) => {
   showProjectForm(await response.json() as User)
 }).catch(() => showSignIn('The registration service is unavailable right now. You can still join the waitlist above.'))
 }
+
+// Pause banner: shown on every page (landing and app pages alike) while money
+// movement is halted. Best effort — a failed status check shows nothing.
+fetch('/api/v1/status').then(async (response) => {
+  if (!response.ok) return
+  const status = await response.json().catch(() => null) as { outflows_paused?: boolean; funding_paused?: boolean; message?: string } | null
+  if (!status || (!status.outflows_paused && !status.funding_paused) || document.querySelector('#pause-banner')) return
+  const banner = document.createElement('div')
+  banner.id = 'pause-banner'
+  banner.className = 'pause-banner'
+  banner.setAttribute('role', 'status')
+  const text = document.createElement('span')
+  text.textContent = status.message || 'Money movement is temporarily paused.'
+  banner.appendChild(text)
+  document.body.prepend(banner)
+}).catch(() => undefined)
