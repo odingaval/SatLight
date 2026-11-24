@@ -22,7 +22,10 @@ help:
 	@echo "  migrate-down  Rollback last migration"
 	@echo "  generate      Generate code (SQLC, mocks, etc.)"
 
-dev: docker-up
+dev-init:
+	@./scripts/dev-init.sh
+
+dev: dev-init docker-up
 	@echo "Waiting for services to be ready..."
 	@sleep 5
 	@$(MAKE) migrate-up
@@ -42,7 +45,7 @@ test-int:
 
 test-ln:
 	@echo "Running Lightning integration tests on regtest..."
-	@go test -v -tags=integration ./internal/lightning/...
+	@./scripts/ln-test.sh
 
 lint:
 	golangci-lint run ./...
@@ -61,8 +64,7 @@ vulncheck:
 
 openapi:
 	@echo "Validating OpenAPI spec..."
-	@which swagger-codegen || (echo "swagger-codegen not installed" && exit 1)
-	swagger-codegen validate -i openapi.yaml
+	@npx --yes @redocly/cli lint docs/specs/openapi.yaml --format summary
 
 build:
 	CGO_ENABLED=1 go build -o bin/satlight-api ./cmd/api

@@ -1,0 +1,87 @@
+# Regtest network for `make test-ln`. Isolated from dev ports and data: the Go
+# suite (internal/lightning/regtest_test.go) drives everything through these
+# two nodes. Data dirs are bind-mounted (and gitignored) so tests can read
+# the TLS certs and macaroons LND writes on startup.
+services:
+  bitcoind:
+    image: lncm/bitcoind:v26.0
+    command:
+      - -regtest=1
+      - -fallbackfee=0.0001
+      - -txindex=1
+      - -rpcuser=satlight
+      - -rpcpassword=satlight
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+    ports:
+      - "28443:18443"
+      - "28444:18444"
+    volumes:
+      - ./testdata/ln-regtest/bitcoind:/data
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=satlight", "-rpcpassword=satlight", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  lnd-app:
+    image: lightninglabs/lnd:v0.21.4-beta
+    command:
+      - --bitcoin.regtest
+      - --bitcoin.active
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpcuser=satlight
+      - --bitcoind.rpcpass=satlight
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      - --lnddir=/data
+      - --listen=0.0.0.0:9735
+      - --rpclisten=0.0.0.0:10009
+      - --tlsextradomain=localhost
+      - --adminmacaroonpath=/data/chain/bitcoin/regtest/admin.macaroon
+      - --readonlymacaroonpath=/data/chain/bitcoin/regtest/readonly.macaroon
+      - --invoicemacaroonpath=/data/chain/bitcoin/regtest/invoice.macaroon
+      - --wallet-unlock-password-file=/data/wallet.pass
+      - --wallet-unlock-allow-create
+      - --bitcoin.defaultremotedelay=144
+    ports:
+      - "19735:9735"
+      - "11009:10009"
+    volumes:
+      - ./testdata/ln-regtest/app:/data
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+
+  lnd-contrib:
+    image: lightninglabs/lnd:v0.21.4-beta
+    command:
+      - --bitcoin.regtest
+      - --bitcoin.active
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpcuser=satlight
+      - --bitcoind.rpcpass=satlight
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      - --lnddir=/data
+      - --listen=0.0.0.0:9735
+      - --rpclisten=0.0.0.0:10009
+      - --tlsextradomain=localhost
+      - --adminmacaroonpath=/data/chain/bitcoin/regtest/admin.macaroon
+      - --readonlymacaroonpath=/data/chain/bitcoin/regtest/readonly.macaroon
+      - --invoicemacaroonpath=/data/chain/bitcoin/regtest/invoice.macaroon
+      - --wallet-unlock-password-file=/data/wallet.pass
+      - --wallet-unlock-allow-create
+      - --bitcoin.defaultremotedelay=144
+    ports:
+      - "19736:9735"
+      - "11010:10009"
+    volumes:
+      - ./testdata/ln-regtest/contrib:/data
+    depends_on:
+      bitcoind:
+        condition: service_healthy

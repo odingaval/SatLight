@@ -72,3 +72,6 @@ docs/guides/BACKEND_IMPLEMENTATION.md
 # Backup files
 *.bak
 *.backup
+
+# Regtest network data (chain state, wallets, certs, macaroons, passwords)
+testdata/ln-regtest/

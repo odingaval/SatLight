@@ -1,0 +1,47 @@
+# Satlight Prometheus alert rules. Load with:
+#
+#   rule_files:
+#     - monitoring/alerts.yml
+#
+# TEAM TODO: point Alertmanager at the paging provider (receiver credentials
+# are a team secret) and fill the on-call rotation; see
+# docs/runbooks/operations.md.
+groups:
+  - name: satlight-critical
+    rules:
+      - alert: SatlightReconciliationCritical
+        expr: increase(satlight_reconciliation_runs_total{severity="critical"}[15m]) > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: Reconciliation found critical drift; payouts auto-paused
+          runbook_url: docs/runbooks/operations.md#kill-switch
+
+      - alert: SatlightLedgerDriftHigh
+        expr: abs(satlight_reconciliation_drift_sats) > 100
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: Node-minus-books drift beyond 100 sats
+          runbook_url: docs/runbooks/operations.md#kill-switch
+
+  - name: satlight-warning
+    rules:
+      - alert: SatlightPayoutHoldRateHigh
+        expr: |
+          sum(rate(satlight_payouts_completed_total{outcome=~"held|expired"}[15m]))
+          /
+          sum(rate(satlight_payouts_completed_total[15m])) > 0.05
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: More than 5% of payouts held or expiring over 15m
+          runbook_url: docs/runbooks/operations.md#routine-tasks
+
+      - alert: SatlightDepositSettlementLagHigh
+        expr: histogram_quantile(0.95, rate(satlight_deposit_settlement_lag_seconds_bucket[30m])) > 3600
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: p95 deposit settlement lag above 1h; the invoice stream may be down
+          runbook_url: docs/runbooks/operations.md#routine-tasks

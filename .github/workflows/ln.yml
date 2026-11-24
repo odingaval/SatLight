@@ -1,0 +1,32 @@
+name: lightning-regtest
+
+# The regtest suite is slow (boots bitcoind + 2 LND nodes), so it runs nightly
+# and on payout/lightning-code changes instead of on every push.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  push:
+    branches: [main]
+    paths:
+      - internal/lightning/**
+      - internal/payout/**
+      - internal/bounty/**
+      - scripts/ln-*
+      - scripts/lninit/**
+      - docker-compose.ln.yml
+      - Makefile
+  workflow_dispatch:
+
+jobs:
+  regtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Regtest suite
+        run: make test-ln
