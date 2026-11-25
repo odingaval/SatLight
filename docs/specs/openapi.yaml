@@ -124,6 +124,11 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: 'Already resolved, no longer disputed, or no verified merge for a payout resolution' }
   /projects:
+    get:
+      summary: List the signer's registered projects, newest first
+      responses:
+        '200': { description: Projects, content: { application/json: { schema: { type: object, properties: { projects: { type: array, items: { $ref: '#/components/schemas/Project' } } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
     post:
       summary: Register a project (maintainer with GitHub App installed)
       requestBody:
@@ -293,7 +298,7 @@ components:
           properties: { code: { type: string }, message: { type: string } }
     WaitlistRequest: { type: object, required: [email], properties: { email: { type: string, format: email }, role: { type: string, enum: [maintainer, contributor] } } }
     User: { type: object, properties: { id: { type: integer }, github_login: { type: string }, lightning_address: { type: string, nullable: true } } }
-    Project: { type: object, properties: { id: { type: integer }, repo_full_name: { type: string }, status: { type: string } } }
+    Project: { type: object, properties: { id: { type: integer }, repo_full_name: { type: string }, status: { type: string }, language: { type: string }, created_at: { type: string, format: date-time } } }
     ProjectCreate: { type: object, required: [repo_full_name, installation_id], properties: { repo_full_name: { type: string }, installation_id: { type: integer } } }
     Wallet: { type: object, properties: { available_sats: { type: integer }, reserved_sats: { type: integer } } }
     Deposit: { type: object, properties: { id: { type: integer }, bolt11: { type: string }, amount_sats: { type: integer }, status: { type: string }, expires_at: { type: string, format: date-time } } }

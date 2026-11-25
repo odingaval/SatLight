@@ -678,3 +678,36 @@ func TestIntegrationAPIStatusReflectsPauseFlags(t *testing.T) {
 		t.Fatal("paused status has no user message")
 	}
 }
+
+func TestIntegrationAPIListProjects(t *testing.T) {
+	f := newAPIFixture(t)
+	owner := f.user(t, "projects-owner@example.test")
+	other := f.user(t, "projects-other@example.test")
+	first := f.project(t, owner, 0)
+	second := f.project(t, owner, 0)
+	f.project(t, other, 0)
+
+	recorder := doRequest(t, f.router, "GET", "/api/v1/projects", nil, nil, f.cookie(t, owner))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/projects = %d, want 200", recorder.Code)
+	}
+	items, _ := decodeBody(t, recorder)["projects"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("projects = %d items, want 2 (own only)", len(items))
+	}
+	// Newest first.
+	if got := int64(items[0].(map[string]any)["id"].(float64)); got != second {
+		t.Fatalf("first item id = %d, want newest project %d", got, second)
+	}
+	if got := int64(items[1].(map[string]any)["id"].(float64)); got != first {
+		t.Fatalf("second item id = %d, want oldest project %d", got, first)
+	}
+	if repo := items[0].(map[string]any)["repo_full_name"].(string); repo == "" {
+		t.Fatal("project is missing repo_full_name")
+	}
+
+	recorder = doRequest(t, f.router, "GET", "/api/v1/projects", nil, nil)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous GET /api/v1/projects = %d, want 401", recorder.Code)
+	}
+}

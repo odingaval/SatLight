@@ -215,6 +215,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/disputes/:id/resolve", s.authRequired(), s.handleResolveDispute)
 
 		v1.POST("/projects", s.authRequired(), s.handleCreateProject)
+		v1.GET("/projects", s.authRequired(), s.handleListProjects)
 		v1.GET("/projects/:id/wallet", s.authRequired(), s.handleGetWallet)
 		v1.POST("/projects/:id/deposits", s.authRequired(), s.rateLimitMiddleware(rateLimitScopeDeposits), s.handleCreateDeposit)
 		v1.POST("/projects/:id/withdrawals", s.authRequired(), s.handleCreateWithdrawal)
@@ -685,6 +686,44 @@ func (s *Server) handleListRegistrableRepos(c *gin.Context) {
 		items = append(items, gin.H{"installation_id": repo.InstallationID, "full_name": repo.FullName, "private": repo.Private})
 	}
 	c.JSON(http.StatusOK, gin.H{"install_url": installURL, "repositories": items})
+}
+
+// handleListProjects returns the signed-in maintainer's registered projects,
+// newest first.
+func (s *Server) handleListProjects(c *gin.Context) {
+	userID, ok := auth.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "unauthorized"}})
+		return
+	}
+	rows, err := s.pool.Query(c.Request.Context(), `
+		SELECT id, repo_full_name, status, COALESCE(language, ''), created_at
+		FROM projects WHERE owner_user_id = $1 ORDER BY created_at DESC, id DESC
+	`, userID)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to list projects")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not list projects"}})
+		return
+	}
+	defer rows.Close()
+	items := []gin.H{}
+	for rows.Next() {
+		var id int64
+		var repoFullName, status, language string
+		var createdAt time.Time
+		if err := rows.Scan(&id, &repoFullName, &status, &language, &createdAt); err != nil {
+			s.logger.Error().Err(err).Msg("failed to scan project row")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not list projects"}})
+			return
+		}
+		items = append(items, gin.H{"id": id, "repo_full_name": repoFullName, "status": status, "language": language, "created_at": createdAt})
+	}
+	if err := rows.Err(); err != nil {
+		s.logger.Error().Err(err).Msg("failed to read project rows")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "could not list projects"}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"projects": items})
 }
 
 func (s *Server) handleCreateProject(c *gin.Context) {

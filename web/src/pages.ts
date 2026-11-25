@@ -26,7 +26,7 @@ const qrSvg = (bolt11: string) => {
     return ''
   }
 }
-const header = `<header class="site-header"><div class="container nav"><a class="nav-brand" href="/"><span class="brand-mark" aria-hidden="true"></span> satlight</a><nav class="nav-links"><a class="nav-link" href="/bounties">Browse bounties</a><a class="nav-link" href="/my-work">My work</a><a class="nav-link" href="/settings">Settings</a><a class="btn btn-dark nav-cta" href="/#register">Register a project ↗</a></nav></div></header>`
+const header = `<header class="site-header"><div class="container nav"><a class="nav-brand" href="/"><span class="brand-mark" aria-hidden="true"></span> satlight</a><nav class="nav-links"><a class="nav-link" href="/bounties">Browse bounties</a><a class="nav-link" href="/my-work">My work</a><a class="nav-link" href="/my-projects">My projects</a><a class="nav-link" href="/settings">Settings</a><a class="btn btn-dark nav-cta" href="/#register">Register a project ↗</a></nav></div></header>`
 
 export function renderExtraPage(app: HTMLDivElement, path: string) {
   if (path === '/bounties') { renderBrowse(app); return true }
@@ -36,6 +36,7 @@ export function renderExtraPage(app: HTMLDivElement, path: string) {
   const dashboardPath = path.match(/^\/dashboard\/(\d+)$/)
   if (dashboardPath) { void renderDashboard(app, dashboardPath[1]); return true }
   if (path === '/my-work') { void renderMyWork(app); return true }
+  if (path === '/my-projects') { void renderMyProjects(app); return true }
   if (path === '/settings') { void renderSettings(app); return true }
   if (path === '/settings/confirm') { void renderConfirmDestination(app); return true }
   return false
@@ -191,6 +192,34 @@ async function renderMyWork(app: HTMLDivElement) {
   } catch (error) {
     claimsTarget.innerHTML = `<p class="market-state is-error">${escapeHtml(error instanceof Error ? error.message : 'Could not load your work.')}</p>`
     payoutsTarget.innerHTML = ''
+  }
+}
+
+type Project = { id: number; repo_full_name: string; status: string; language: string; created_at: string }
+
+async function renderMyProjects(app: HTMLDivElement) {
+  app.innerHTML = `${header}<main class="container detail-page"><h1>My projects</h1><p>Every repository you registered, newest first.</p><div id="project-list" class="market-state">Loading projects…</div></main>`
+  const target = document.querySelector<HTMLDivElement>('#project-list')!
+  try {
+    const response = await fetch('/api/v1/projects')
+    if (response.status === 401) {
+      target.innerHTML = '<p>Sign in to see your projects.</p><a class="btn btn-dark" href="/api/v1/auth/github">Continue with GitHub ↗</a>'
+      return
+    }
+    if (!response.ok) throw new Error('Could not load your projects.')
+    const data = await response.json() as { projects?: Project[] }
+    const projects = data.projects ?? []
+    if (projects.length === 0) {
+      target.innerHTML = '<p>No projects yet.</p><a class="btn btn-dark" href="/#register">Register your first repository ↗</a>'
+      return
+    }
+    target.innerHTML = projects.map((project) => {
+      const dashboardURL = `/dashboard/${project.id}?repo=${encodeURIComponent(project.repo_full_name)}`
+      const meta = [`● ${escapeHtml(project.status)}`, project.language ? escapeHtml(project.language) : '', new Date(project.created_at).toLocaleDateString()].filter(Boolean).join(' · ')
+      return `<article class="market-card"><div class="market-card-meta"><span>${meta}</span></div><h2><a href="${dashboardURL}">${escapeHtml(project.repo_full_name)}</a></h2><div class="market-card-foot"><a class="btn btn-dark" href="${dashboardURL}">Open dashboard →</a><a class="btn" href="https://github.com/${encodeURIComponent(project.repo_full_name).replace(/%2F/g, '/')}">GitHub ↗</a></div></article>`
+    }).join('')
+  } catch (error) {
+    target.innerHTML = `<p class="market-state is-error">${escapeHtml(error instanceof Error ? error.message : 'Could not load your projects.')}</p>`
   }
 }
 

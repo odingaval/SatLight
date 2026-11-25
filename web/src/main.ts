@@ -17,6 +17,7 @@ app.innerHTML = `
       <a class="nav-brand" href="#top" aria-label="Satlight home"><span class="brand-mark" aria-hidden="true"></span> satlight</a>
       <nav class="nav-links" aria-label="Main navigation">
         <a class="nav-link" href="/bounties">Browse bounties</a>
+        <a class="nav-link" href="/my-projects">My projects</a>
         <a class="nav-link" href="#how-it-works">How it works</a>
         <a class="nav-link" href="#for-projects">For projects</a>
         <a class="btn btn-dark nav-cta" href="#join">Join the waitlist <span aria-hidden="true">↗</span></a>
