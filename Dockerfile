@@ -27,6 +27,7 @@ COPY --from=webbuild /app/web/dist/. ./internal/api/webdist/
 RUN CGO_ENABLED=1 GOOS=linux go build -o /satlight-api ./cmd/api
 RUN CGO_ENABLED=1 GOOS=linux go build -o /satlight-worker ./cmd/worker
 RUN CGO_ENABLED=1 GOOS=linux go build -o /satlight-migrate ./cmd/migrate
+RUN CGO_ENABLED=1 GOOS=linux go build -o /satlight-opsctl ./cmd/opsctl
 
 FROM alpine:3.19
 
@@ -37,6 +38,7 @@ WORKDIR /app
 COPY --from=builder /satlight-api /app/satlight-api
 COPY --from=builder /satlight-worker /app/satlight-worker
 COPY --from=builder /satlight-migrate /app/satlight-migrate
+COPY --from=builder /satlight-opsctl /app/satlight-opsctl
 COPY --from=builder /app/migrations /app/migrations
 COPY --from=builder /app/.env.example /app/.env.example
 COPY --from=builder /app/scripts/start-render.sh /app/start-render.sh
