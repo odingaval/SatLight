@@ -5,6 +5,7 @@ help:
 	@echo ""
 	@echo "Available commands:"
 	@echo "  dev           Start API + worker + DB + Lightning (start web separately in web/)"
+	@echo "  dev-wallets   Create dev LND wallets on first boot (idempotent)"
 	@echo "  seed          Load sample projects and bounties"
 	@echo "  test          Run unit tests"
 	@echo "  test-int      Run integration tests (requires containers)"
@@ -24,6 +25,9 @@ help:
 
 dev-init:
 	@./scripts/dev-init.sh
+
+dev-wallets:
+	@./scripts/dev-wallets.sh
 
 dev: dev-init docker-up
 	@echo "Waiting for services to be ready..."

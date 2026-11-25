@@ -106,8 +106,8 @@ func main() {
 	_, err = tx.Exec(ctx, `
 		INSERT INTO ledger_entries (tx_id, account, direction, amount_sats, ref_type, ref_id)
 		VALUES ($1, 'node:liquidity', 'debit', 1000000, 'seed', NULL),
-		       ($1, 'project:' || $2::text || ':available', 'credit', 1000000, 'seed', NULL)
-	`, depositTx, projectID)
+		       ($1, $2, 'credit', 1000000, 'seed', NULL)
+	`, depositTx, fmt.Sprintf("project:%d:available", projectID))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to seed deposit ledger entries")
 	}
@@ -143,9 +143,10 @@ func main() {
 		reserveTx := uuid.NewString()
 		_, err = tx.Exec(ctx, `
 			INSERT INTO ledger_entries (tx_id, account, direction, amount_sats, ref_type, ref_id)
-			VALUES ($1, 'project:' || $2::text || ':available', 'debit', $4, 'bounty_reserve', $3),
-			       ($1, 'project:' || $2::text || ':reserved', 'credit', $4, 'bounty_reserve', $3)
-		`, reserveTx, projectID, bountyID, b.reward)
+			VALUES ($1, $2, 'debit', $4, 'bounty_reserve', $3),
+			       ($1, $5, 'credit', $4, 'bounty_reserve', $3)
+		`, reserveTx, fmt.Sprintf("project:%d:available", projectID), bountyID, b.reward,
+			fmt.Sprintf("project:%d:reserved", projectID))
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to seed bounty reservation ledger entries")
 		}

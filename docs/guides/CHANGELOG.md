@@ -4,6 +4,7 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 ### Added
+- Fresh `make dev` works end to end: LND data dir, cert SANs, wallet auto-unlock + `make dev-wallets` first-boot creation, worker secrets, and a `make seed` ledger-encoding fix. New `docs/runbooks/signet-node.md` provisions the staging Lightning node.
 - Initial documentation set, OpenAPI draft, database schema, ADRs.
 - Single-origin deployment: the API serves the embedded Vite build with an SPA fallback when `SERVE_STATIC=true`, so one URL hosts the UI and `/api/*` and session cookies stay same-origin (off by default; API 404s unchanged).
 - Render blueprint (`render.yaml`): Docker web service + background worker + managed Postgres with pre-deploy migrations; `BASE_URL`/`WEB_URL` default to `RENDER_EXTERNAL_URL` when unset.

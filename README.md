@@ -57,6 +57,7 @@ cd satlight
 
 ./scripts/dev-init.sh     # generate per-checkout secrets into .env (gitignored)
 make dev                    # API + workers + Postgres + regtest bitcoind + 2 LND nodes
+make dev-wallets            # create the LND wallets on first boot (skips when present)
 ./scripts/dev-macaroon.sh   # bake the constrained payment macaroon, then restart api/worker
 make seed                   # load sample projects and bounties
 ```

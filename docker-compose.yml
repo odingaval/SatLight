@@ -58,14 +58,18 @@ services:
       "--bitcoind.rpchost=bitcoind:18443",
       "--bitcoind.zmqpubrawblock=tcp://bitcoind:28332",
       "--bitcoind.zmqpubrawtx=tcp://bitcoind:28333",
+      "--lnddir=/data",
       "--externalip=localhost",
       "--listen=0.0.0.0:9735",
       "--rpclisten=0.0.0.0:10009",
       "--restlisten=0.0.0.0:8080",
       "--tlsextradomain=localhost",
+      "--tlsextradomain=lnd",
       "--adminmacaroonpath=/data/chain/bitcoin/regtest/admin.macaroon",
       "--invoicemacaroonpath=/data/chain/bitcoin/regtest/invoice.macaroon",
-      "--readonlymacaroonpath=/data/chain/bitcoin/regtest/readonly.macaroon"
+      "--readonlymacaroonpath=/data/chain/bitcoin/regtest/readonly.macaroon",
+      "--wallet-unlock-password-file=/data/wallet.pass",
+      "--wallet-unlock-allow-create"
     ]
     ports:
       - "9735:9735"
@@ -73,6 +77,7 @@ services:
       - "8081:8080"
     volumes:
       - lnd_data:/data
+      - ./dev/lnd/app.pass:/data/wallet.pass:ro
     depends_on:
       bitcoind:
         condition: service_healthy
@@ -80,7 +85,7 @@ services:
       - LND_BITCOIND_RPCUSER=satlight
       - LND_BITCOIND_RPCPASS=satlight
     healthcheck:
-      test: ["CMD", "lncli", "--network=regtest", "--rpcserver=localhost:10009", "--macaroonpath=/data/chain/bitcoin/regtest/admin.macaroon", "getinfo"]
+      test: ["CMD", "lncli", "--network=regtest", "--rpcserver=localhost:10009", "--tlscertpath=/data/tls.cert", "--macaroonpath=/data/chain/bitcoin/regtest/admin.macaroon", "getinfo"]
       interval: 10s
       timeout: 10s
       retries: 10
@@ -97,6 +102,7 @@ services:
       "--bitcoind.rpchost=bitcoind:18443",
       "--bitcoind.zmqpubrawblock=tcp://bitcoind:28332",
       "--bitcoind.zmqpubrawtx=tcp://bitcoind:28333",
+      "--lnddir=/data",
       "--externalip=localhost",
       "--listen=0.0.0.0:9736",
       "--rpclisten=0.0.0.0:10010",
@@ -104,7 +110,9 @@ services:
       "--tlsextradomain=localhost",
       "--adminmacaroonpath=/data/chain/bitcoin/regtest/admin.macaroon",
       "--invoicemacaroonpath=/data/chain/bitcoin/regtest/invoice.macaroon",
-      "--readonlymacaroonpath=/data/chain/bitcoin/regtest/readonly.macaroon"
+      "--readonlymacaroonpath=/data/chain/bitcoin/regtest/readonly.macaroon",
+      "--wallet-unlock-password-file=/data/wallet.pass",
+      "--wallet-unlock-allow-create"
     ]
     ports:
       - "9736:9736"
@@ -112,6 +120,7 @@ services:
       - "8083:8080"
     volumes:
       - lnd_contributor_data:/data
+      - ./dev/lnd/contrib.pass:/data/wallet.pass:ro
     depends_on:
       bitcoind:
         condition: service_healthy
@@ -171,6 +180,8 @@ services:
       - LND_PAYMENT_MACAROON=/data/chain/bitcoin/regtest/payment.macaroon # bake with scripts/dev-macaroon.sh; never admin
       - PLATFORM_FEE_BPS=200
       - PAYOUTS_PAUSED=false
+      - SESSION_SECRET=${SESSION_SECRET:?run scripts/dev-init.sh to generate .env secrets}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?run scripts/dev-init.sh to generate .env secrets}
       - LOG_LEVEL=debug
     volumes:
       - lnd_data:/data:ro
