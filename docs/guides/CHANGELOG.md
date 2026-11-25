@@ -34,6 +34,7 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 - Stale docs refreshed: ADR index statuses, documentation index links, backend limitations, and the ADR-011 implementation notes now match the code.
 - Least-privilege LND access: balance reads moved to the payment connection so the invoice macaroon needs only `invoices:read+write`; dev bakes a constrained payment macaroon (`offchain:read+write`, `onchain:read`) via `scripts/dev-macaroon.sh` instead of using admin, dev secrets generate per checkout via `scripts/dev-init.sh`, and the secrets-manager path for staging/prod is documented in the runbook. `queue.NewClient` returns construction errors instead of panicking.
 - Funding invoices render a scannable QR code (SVG, `lightning:` URI) above the copyable text for mobile wallets.
+- Project registration suggests repositories: typing an installation ID offers the signer's admin repositories from `GET /api/v1/github/installations/{id}/repositories` as a dropdown, with manual entry kept as a fallback.
 - Ledger balance gate gains a fuzz test (`FuzzValidateEntries`) proving it accepts exactly the balanced, positive, overflow-free transactions.
 - CORS now allows the configured web origin instead of `*`.
 - The API server no longer panics on startup (the insert-only River client now registers the required worker set).

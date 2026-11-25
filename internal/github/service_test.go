@@ -1,11 +1,16 @@
 package github
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
+
+	"github.com/google/go-github/v60/github"
 )
 
 func TestVerifyWebhookSignature(t *testing.T) {
@@ -90,5 +95,71 @@ func TestExtractIssueNumber(t *testing.T) {
 				t.Fatalf("extractIssueNumber(%q) = %d, want %d", test.body, got, test.want)
 			}
 		})
+	}
+}
+
+func TestListAdminRepos(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/installation/repositories":
+			_, _ = w.Write([]byte(`{"total_count":3,"repositories":[
+				{"full_name":"octo/zebra","private":true},
+				{"full_name":"octo/apple","private":false},
+				{"full_name":"octo/shared","private":false}]}`))
+		case "/repos/octo/zebra/collaborators/maintainer/permission":
+			_, _ = w.Write([]byte(`{"permission":"admin"}`))
+		case "/repos/octo/apple/collaborators/maintainer/permission":
+			_, _ = w.Write([]byte(`{"permission":"admin"}`))
+		case "/repos/octo/shared/collaborators/maintainer/permission":
+			_, _ = w.Write([]byte(`{"permission":"write"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	service := NewService(&Config{}, nil)
+	service.SetInstallationClientFactory(func(int64) (*github.Client, error) {
+		client := github.NewClient(nil)
+		base, err := url.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.BaseURL = base
+		client.UploadURL = base
+		return client, nil
+	})
+	repos, err := service.ListAdminRepos(context.Background(), 123, "maintainer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 2 || repos[0].FullName != "octo/apple" || repos[1].FullName != "octo/zebra" {
+		t.Fatalf("ListAdminRepos() = %+v, want sorted admin-only [octo/apple octo/zebra]", repos)
+	}
+	if repos[0].Private || !repos[1].Private {
+		t.Fatalf("privacy flags = %+v, want apple public, zebra private", repos)
+	}
+}
+
+func TestListAdminReposPropagatesListErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	service := NewService(&Config{}, nil)
+	service.SetInstallationClientFactory(func(int64) (*github.Client, error) {
+		client := github.NewClient(nil)
+		base, err := url.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.BaseURL = base
+		client.UploadURL = base
+		return client, nil
+	})
+	if _, err := service.ListAdminRepos(context.Background(), 123, "maintainer"); err == nil {
+		t.Fatal("ListAdminRepos() = nil, want the API error")
 	}
 }

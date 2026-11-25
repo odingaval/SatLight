@@ -124,10 +124,55 @@ function showSignIn(message = 'Sign in with GitHub to register a repository you 
 }
 
 function showProjectForm(user: User) {
-  registerCard.innerHTML = `<p class="signed-in-as">Signed in as <strong>@${escapeHtml(user.github_login)}</strong></p><form id="project-form"><label class="form-label" for="repo-name">GitHub repository</label><input class="form-input" id="repo-name" name="repo_full_name" placeholder="owner/repository" pattern="[^/\\s]+/[^/\\s]+" required><label class="form-label" for="installation-id">GitHub App installation ID</label><input class="form-input" id="installation-id" name="installation_id" type="number" min="1" step="1" placeholder="Shown in your GitHub App installation URL" required><p class="register-hint">Install the Satlight GitHub App on the repository first. Its installation ID appears in the URL after setup.</p><button class="btn btn-primary register-button" type="submit">Register repository <span aria-hidden="true">→</span></button><p class="register-message" id="project-message" role="status" aria-live="polite"></p></form>`
+  registerCard.innerHTML = `<p class="signed-in-as">Signed in as <strong>@${escapeHtml(user.github_login)}</strong></p><form id="project-form"><label class="form-label" for="repo-name">GitHub repository</label><input class="form-input" id="repo-name" name="repo_full_name" placeholder="owner/repository" pattern="[^/\\s]+/[^/\\s]+" list="repo-suggestions" autocomplete="off" required><datalist id="repo-suggestions"></datalist><label class="form-label" for="installation-id">GitHub App installation ID</label><input class="form-input" id="installation-id" name="installation_id" type="number" min="1" step="1" placeholder="Shown in your GitHub App installation URL" required><p class="register-hint">Install the Satlight GitHub App on the repository first. Its installation ID appears in the URL after setup.</p><button class="btn btn-primary register-button" type="submit">Register repository <span aria-hidden="true">→</span></button><p class="register-message" id="project-message" role="status" aria-live="polite"></p></form>`
 
   const projectForm = registerCard.querySelector<HTMLFormElement>('#project-form')!
   const message = registerCard.querySelector<HTMLParagraphElement>('#project-message')!
+  const installInput = registerCard.querySelector<HTMLInputElement>('#installation-id')!
+  const suggestions = registerCard.querySelector<HTMLDataListElement>('#repo-suggestions')!
+  const hint = registerCard.querySelector<HTMLParagraphElement>('.register-hint')!
+  const hintText = hint.textContent
+
+  // Suggest the installation's admin repositories as the ID is typed. Best
+  // effort: failures and unknown IDs leave manual entry untouched.
+  let suggestTimer = 0
+  let suggestSeq = 0
+  installInput.addEventListener('input', () => {
+    window.clearTimeout(suggestTimer)
+    const id = Number(installInput.value)
+    if (!Number.isInteger(id) || id <= 0) {
+      suggestions.replaceChildren()
+      hint.textContent = hintText
+      return
+    }
+    suggestTimer = window.setTimeout(async () => {
+      const seq = ++suggestSeq
+      hint.textContent = 'Loading your repositories…'
+      try {
+        const response = await fetch(`/api/v1/github/installations/${id}/repositories`)
+        if (seq !== suggestSeq) return
+        if (!response.ok) throw new Error()
+        const data = await response.json() as { repositories?: { full_name: string; private: boolean }[] }
+        const repos = data.repositories ?? []
+        suggestions.replaceChildren()
+        if (repos.length === 0) {
+          hint.textContent = 'No repositories found for that installation ID — check the number, or type owner/repository manually.'
+          return
+        }
+        for (const repo of repos) {
+          const option = document.createElement('option')
+          option.value = repo.full_name
+          option.label = repo.private ? `${repo.full_name} (private)` : repo.full_name
+          suggestions.appendChild(option)
+        }
+        hint.textContent = `Pick one of your ${repos.length} ${repos.length === 1 ? 'repository' : 'repositories'} above, or type owner/repository manually.`
+      } catch {
+        if (seq !== suggestSeq) return
+        suggestions.replaceChildren()
+        hint.textContent = hintText
+      }
+    }, 600)
+  })
   projectForm.addEventListener('submit', async (event) => {
     event.preventDefault()
     const button = projectForm.querySelector<HTMLButtonElement>('button')!
