@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -521,57 +520,6 @@ func (s *Service) VerifyRepoAdmin(ctx context.Context, installationID int64, git
 		return false, err
 	}
 	return perm.GetPermission() == "admin", nil
-}
-
-// RepoInfo is the registration-picker view of one repository.
-type RepoInfo struct {
-	FullName string
-	Private  bool
-}
-
-// maxListRepos caps the registration picker: per-repo permission checks
-// cost one API call each, so huge installations page no further and the
-// form keeps manual entry as a fallback.
-const maxListRepos = 100
-
-// ListAdminRepos returns the installation's repositories the given user
-// administers, sorted by full name. Registration requires repo admin, so
-// anything else would only fail at submit time.
-func (s *Service) ListAdminRepos(ctx context.Context, installationID int64, githubLogin string) ([]RepoInfo, error) {
-	client, err := s.newInstallationClient(installationID)
-	if err != nil {
-		return nil, err
-	}
-	var out []RepoInfo
-	opts := &github.ListOptions{PerPage: 100}
-	for {
-		listed, resp, err := client.Apps.ListRepos(ctx, opts)
-		if err != nil {
-			return nil, err
-		}
-		for _, repo := range listed.Repositories {
-			parts := strings.Split(repo.GetFullName(), "/")
-			if len(parts) != 2 {
-				continue
-			}
-			perm, _, err := client.Repositories.GetPermissionLevel(ctx, parts[0], parts[1], githubLogin)
-			if err != nil {
-				continue
-			}
-			if perm.GetPermission() == "admin" {
-				out = append(out, RepoInfo{FullName: repo.GetFullName(), Private: repo.GetPrivate()})
-			}
-			if len(out) >= maxListRepos {
-				return out, nil
-			}
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].FullName < out[j].FullName })
-	return out, nil
 }
 
 // GetRepoLanguage returns the primary language GitHub reports for a repo.
