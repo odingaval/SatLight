@@ -39,6 +39,8 @@ COPY --from=builder /satlight-worker /app/satlight-worker
 COPY --from=builder /satlight-migrate /app/satlight-migrate
 COPY --from=builder /app/migrations /app/migrations
 COPY --from=builder /app/.env.example /app/.env.example
+COPY --from=builder /app/scripts/start-render.sh /app/start-render.sh
+RUN chmod +x /app/start-render.sh
 
 ENV APP_ENV=production
 

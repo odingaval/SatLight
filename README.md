@@ -98,6 +98,11 @@ credentials for a second App whose callback is
 `<service URL>/api/v1/auth/github/callback`, and `LND_*` once a node exists
 (funding endpoints answer 503 until then). Signet/testnet only.
 
+Free-plan shortcut (no paid worker or pre-deploy hook): create the web
+service manually and set its Docker Command to `/app/start-render.sh`,
+which migrates the database and then runs the worker alongside the API in
+the one container.
+
 ## Configuration
 
 Key environment variables (full list in `.env.example`):
