@@ -232,7 +232,7 @@ func (s *Server) setupRoutes() {
 
 		v1.POST("/webhooks/github", s.rateLimitMiddleware(rateLimitScopeWebhooks), s.handleGitHubWebhook)
 
-		v1.GET("/github/registrable-repositories", s.authRequired(), s.handleListRegistrableRepos)
+		v1.GET("/github/installations/:installationId/repositories", s.authRequired(), s.handleListInstallationRepos)
 	}
 
 	if s.cfg.ServeStatic {
@@ -656,13 +656,17 @@ func (s *Server) handleResolveDispute(c *gin.Context) {
 	}
 }
 
-// handleListRegistrableRepos backs the registration picker: every repository
-// the signed-in user can register, already paired with its installation,
-// plus the App install URL for the empty state.
-func (s *Server) handleListRegistrableRepos(c *gin.Context) {
+// handleListInstallationRepos backs the registration picker: the admin-only
+// repositories the signed-in user can register from one App installation.
+func (s *Server) handleListInstallationRepos(c *gin.Context) {
 	userID, ok := auth.GetUserID(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "unauthorized"}})
+		return
+	}
+	installationID, err := strconv.ParseInt(c.Param("installationId"), 10, 64)
+	if err != nil || installationID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "INVALID_REQUEST", "message": "invalid installation ID"}})
 		return
 	}
 	_, githubLogin, _, _, err := s.services.Auth.GetUserByID(c.Request.Context(), userID)
@@ -670,21 +674,17 @@ func (s *Server) handleListRegistrableRepos(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "could not load the signed-in GitHub user"}})
 		return
 	}
-	repos, err := s.services.GitHub.ListRegistrableRepos(c.Request.Context(), githubLogin)
+	repos, err := s.services.GitHub.ListAdminRepos(c.Request.Context(), installationID, githubLogin)
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to list registrable repositories")
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "GITHUB_ERROR", "message": "could not list your GitHub repositories"}})
+		s.logger.Error().Err(err).Int64("installation_id", installationID).Msg("failed to list installation repositories")
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "GITHUB_ERROR", "message": "could not list repositories for that installation"}})
 		return
-	}
-	installURL := ""
-	if slug := strings.TrimSpace(s.cfg.GitHubAppSlug); slug != "" {
-		installURL = "https://github.com/apps/" + slug + "/installations/new"
 	}
 	items := make([]gin.H, 0, len(repos))
 	for _, repo := range repos {
-		items = append(items, gin.H{"installation_id": repo.InstallationID, "full_name": repo.FullName, "private": repo.Private})
+		items = append(items, gin.H{"full_name": repo.FullName, "private": repo.Private})
 	}
-	c.JSON(http.StatusOK, gin.H{"install_url": installURL, "repositories": items})
+	c.JSON(http.StatusOK, gin.H{"repositories": items})
 }
 
 func (s *Server) handleCreateProject(c *gin.Context) {
