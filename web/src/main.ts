@@ -124,7 +124,7 @@ function showSignIn(message = 'Sign in with GitHub to register a repository you 
 }
 
 function showProjectForm(user: User) {
-  registerCard.innerHTML = `<p class="signed-in-as">Signed in as <strong>@${escapeHtml(user.github_login)}</strong></p><form id="project-form"><label class="form-label" for="repo-name">GitHub repository</label><input class="form-input" id="repo-name" name="repo_full_name" placeholder="owner/repository" pattern="[^/\\s]+/[^/\\s]+" list="repo-suggestions" autocomplete="off" required><datalist id="repo-suggestions"></datalist><label class="form-label" for="installation-id">GitHub App installation ID</label><input class="form-input" id="installation-id" name="installation_id" type="number" min="1" step="1" placeholder="Shown in your GitHub App installation URL" required><p class="register-hint">Install the Satlight GitHub App on the repository first. Its installation ID appears in the URL after setup.</p><button class="btn btn-primary register-button" type="submit">Register repository <span aria-hidden="true">→</span></button><p class="register-message" id="project-message" role="status" aria-live="polite"></p></form>`
+  registerCard.innerHTML = `<p class="signed-in-as">Signed in as <strong>@${escapeHtml(user.github_login)}</strong></p><form id="project-form"><label class="form-label" for="repo-name">GitHub repository</label><input class="form-input" id="repo-name" name="repo_full_name" placeholder="owner/repository" pattern="[^/\\s]+/[^/\\s]+" list="repo-suggestions" autocomplete="off" required><datalist id="repo-suggestions"></datalist><button type="button" id="connect-app" class="btn btn-dark register-button">Connect GitHub App <span aria-hidden="true">↗</span></button><label class="form-label" for="installation-id">GitHub App installation ID</label><input class="form-input" id="installation-id" name="installation_id" type="number" min="1" step="1" placeholder="Filled automatically after Connect" required><p class="register-hint">Pick a repository above, or press Connect to install the App on a new one.</p><button class="btn btn-primary register-button" type="submit">Register repository <span aria-hidden="true">→</span></button><p class="register-message" id="project-message" role="status" aria-live="polite"></p></form>`
 
   const projectForm = registerCard.querySelector<HTMLFormElement>('#project-form')!
   const message = registerCard.querySelector<HTMLParagraphElement>('#project-message')!
@@ -137,16 +137,22 @@ function showProjectForm(user: User) {
   // installation so picking one fills the ID in. Best effort: failures
   // leave manual entry untouched.
   const installForRepo = new Map<string, number>()
-  const installLink = (url: string) => {
-    hint.innerHTML = ''
-    const text = document.createElement('span')
-    text.textContent = 'No repositories found — install the Satlight GitHub App first, then come back here. '
-    const link = document.createElement('a')
-    link.href = url
-    link.target = '_blank'
-    link.rel = 'noopener'
-    link.textContent = 'Install the App ↗'
-    hint.append(text, link)
+  let installUrl = ''
+  const connectButton = registerCard.querySelector<HTMLButtonElement>('#connect-app')!
+  connectButton.addEventListener('click', () => {
+    if (installUrl) window.location.href = installUrl
+    else hint.textContent = 'The install link is not configured yet — ask the site operator to set the GitHub App slug.'
+  })
+  const offerRepos = (repos: { installation_id: number; full_name: string; private: boolean }[]) => {
+    suggestions.replaceChildren()
+    installForRepo.clear()
+    for (const repo of repos) {
+      installForRepo.set(repo.full_name, repo.installation_id)
+      const option = document.createElement('option')
+      option.value = repo.full_name
+      option.label = repo.private ? `${repo.full_name} (private)` : repo.full_name
+      suggestions.appendChild(option)
+    }
   }
   const loadRepos = async () => {
     hint.textContent = 'Loading your repositories…'
@@ -158,22 +164,31 @@ function showProjectForm(user: User) {
       }
       if (!response.ok) throw new Error()
       const data = await response.json() as { install_url?: string; repositories?: { installation_id: number; full_name: string; private: boolean }[] }
+      installUrl = data.install_url ?? ''
       const repos = data.repositories ?? []
-      suggestions.replaceChildren()
-      installForRepo.clear()
-      if (repos.length === 0) {
-        if (data.install_url) installLink(data.install_url)
-        else hint.textContent = 'No repositories found — install the Satlight GitHub App on a repository first, then reload this page.'
+      // Just back from installing: narrow to that installation and fill
+      // its ID in, then drop the query params so a reload stays clean.
+      const params = new URLSearchParams(window.location.search)
+      const setupId = Number(params.get('installation_id'))
+      const setupAction = params.get('setup_action')
+      if (Number.isInteger(setupId) && setupId > 0 && (setupAction === 'install' || setupAction === 'update')) {
+        const fresh = repos.filter((repo) => repo.installation_id === setupId)
+        offerRepos(fresh.length > 0 ? fresh : repos)
+        installInput.value = String(setupId)
+        window.history.replaceState(null, '', window.location.pathname)
+        document.getElementById('register')?.scrollIntoView()
+        hint.textContent = fresh.length > 0
+          ? `App connected — pick one of your ${fresh.length} new ${fresh.length === 1 ? 'repository' : 'repositories'}, then Register.`
+          : 'App connected, but no admin repositories came back yet — wait a moment and reload, or type the details manually.'
         return
       }
-      for (const repo of repos) {
-        installForRepo.set(repo.full_name, repo.installation_id)
-        const option = document.createElement('option')
-        option.value = repo.full_name
-        option.label = repo.private ? `${repo.full_name} (private)` : repo.full_name
-        suggestions.appendChild(option)
+      if (repos.length === 0) {
+        offerRepos([])
+        hint.textContent = 'No repositories found — press Connect to install the Satlight GitHub App, then pick a repository.'
+        return
       }
-      hint.textContent = `Pick one of your ${repos.length} ${repos.length === 1 ? 'repository' : 'repositories'} from the list, or type owner/repository manually.`
+      offerRepos(repos)
+      hint.textContent = `Pick one of your ${repos.length} ${repos.length === 1 ? 'repository' : 'repositories'} from the list, or press Connect to add more.`
     } catch {
       hint.textContent = 'Could not load your repositories — type owner/repository and the installation ID manually.'
     }

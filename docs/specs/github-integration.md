@@ -4,6 +4,7 @@
 - **Permissions:** Metadata (read), Issues (read), Pull requests (read). Contents (read) only if needed later.
 - **Events:** `installation`, `installation_repositories`, `issues`, `pull_request`.
 - **Auth:** installation access tokens for API calls; GitHub OAuth via the App for user sign-in.
+- **Setup URL:** the site root (`<service URL>/`). GitHub redirects there with `?installation_id=&setup_action=` after install/update, and the registration form auto-fills the ID and narrows suggestions to that installation.
 
 ## Webhook handling
 1. Verify `X-Hub-Signature-256` (HMAC-SHA256, constant-time compare). Reject otherwise with 401.
