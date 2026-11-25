@@ -124,14 +124,70 @@ function showSignIn(message = 'Sign in with GitHub to register a repository you 
 }
 
 function showProjectForm(user: User) {
-  registerCard.innerHTML = `<p class="signed-in-as">Signed in as <strong>@${escapeHtml(user.github_login)}</strong></p><form id="project-form"><label class="form-label" for="repo-name">GitHub repository</label><input class="form-input" id="repo-name" name="repo_full_name" placeholder="owner/repository" pattern="[^/\\s]+/[^/\\s]+" required><label class="form-label" for="installation-id">GitHub App installation ID</label><input class="form-input" id="installation-id" name="installation_id" type="number" min="1" step="1" placeholder="Shown in your GitHub App installation URL" required><p class="register-hint">Install the Satlight GitHub App on the repository first. Its installation ID appears in the URL after setup.</p><button class="btn btn-primary register-button" type="submit">Register repository <span aria-hidden="true">→</span></button><p class="register-message" id="project-message" role="status" aria-live="polite"></p></form>`
+  registerCard.innerHTML = `<p class="signed-in-as">Signed in as <strong>@${escapeHtml(user.github_login)}</strong></p><form id="project-form"><label class="form-label" for="repo-name">GitHub repository</label><input class="form-input" id="repo-name" name="repo_full_name" placeholder="owner/repository" pattern="[^/\\s]+/[^/\\s]+" list="repo-suggestions" autocomplete="off" required><datalist id="repo-suggestions"></datalist><input type="hidden" id="installation-id" name="installation_id"><p class="register-hint">Loading your repositories…</p><button class="btn btn-primary register-button" type="submit">Register repository <span aria-hidden="true">→</span></button><p class="register-message" id="project-message" role="status" aria-live="polite"></p></form>`
 
   const projectForm = registerCard.querySelector<HTMLFormElement>('#project-form')!
   const message = registerCard.querySelector<HTMLParagraphElement>('#project-message')!
+  const repoInput = registerCard.querySelector<HTMLInputElement>('#repo-name')!
+  const installInput = registerCard.querySelector<HTMLInputElement>('#installation-id')!
+  const suggestions = registerCard.querySelector<HTMLDataListElement>('#repo-suggestions')!
+  const hint = registerCard.querySelector<HTMLParagraphElement>('.register-hint')!
+
+  // Offer the signer's admin repositories across App installations. Picking
+  // one fills its installation ID invisibly; anything else is rejected at
+  // submit so registration never fails on a bad pairing.
+  const installForRepo = new Map<string, number>()
+  const showInstallLink = (url: string) => {
+    hint.innerHTML = ''
+    hint.append(
+      document.createTextNode('No repositories found — install the Satlight GitHub App first, then reload this page. '),
+      Object.assign(document.createElement('a'), { href: url, target: '_blank', rel: 'noopener', textContent: 'Install the App ↗' }),
+    )
+  }
+  const loadRepos = async () => {
+    try {
+      const response = await fetch('/api/v1/github/registrable-repositories')
+      if (response.status === 401) {
+        showSignIn('Your session expired. Sign in again to register the repository.')
+        return
+      }
+      if (!response.ok) throw new Error()
+      const data = await response.json() as { install_url?: string; repositories?: { installation_id: number; full_name: string; private: boolean }[] }
+      const repos = data.repositories ?? []
+      installForRepo.clear()
+      suggestions.replaceChildren()
+      if (repos.length === 0) {
+        if (data.install_url) showInstallLink(data.install_url)
+        else hint.textContent = 'No repositories found — install the Satlight GitHub App on a repository first, then reload this page.'
+        return
+      }
+      for (const repo of repos) {
+        installForRepo.set(repo.full_name, repo.installation_id)
+        const option = document.createElement('option')
+        option.value = repo.full_name
+        option.label = repo.private ? `${repo.full_name} (private)` : repo.full_name
+        suggestions.appendChild(option)
+      }
+      hint.textContent = `Pick one of your ${repos.length} ${repos.length === 1 ? 'repository' : 'repositories'} from the list.`
+    } catch {
+      hint.textContent = 'Could not load your repositories — reload the page to try again.'
+    }
+  }
+  repoInput.addEventListener('input', () => {
+    const id = installForRepo.get(repoInput.value.trim())
+    installInput.value = id === undefined ? '' : String(id)
+  })
+  void loadRepos()
   projectForm.addEventListener('submit', async (event) => {
     event.preventDefault()
     const button = projectForm.querySelector<HTMLButtonElement>('button')!
     const fields = new FormData(projectForm)
+    if (installInput.value === '') {
+      message.textContent = 'Pick a repository from the list first.'
+      message.className = 'register-message is-error'
+      repoInput.focus()
+      return
+    }
     button.disabled = true
     message.textContent = 'Checking repository access…'
     try {

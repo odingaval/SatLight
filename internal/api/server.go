@@ -231,6 +231,8 @@ func (s *Server) setupRoutes() {
 		v1.GET("/payouts/claim/callback", s.handleWithdrawCallback)
 
 		v1.POST("/webhooks/github", s.rateLimitMiddleware(rateLimitScopeWebhooks), s.handleGitHubWebhook)
+
+		v1.GET("/github/registrable-repositories", s.authRequired(), s.handleListRegistrableRepos)
 	}
 
 	if s.cfg.ServeStatic {
@@ -652,6 +654,37 @@ func (s *Server) handleResolveDispute(c *gin.Context) {
 		s.logger.Error().Err(err).Msg("failed to resolve dispute")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "INTERNAL_ERROR", "message": "failed to resolve dispute"}})
 	}
+}
+
+// handleListRegistrableRepos backs the registration picker: every repository
+// the signed-in user can register, already paired with its installation,
+// plus the App install URL for the empty state.
+func (s *Server) handleListRegistrableRepos(c *gin.Context) {
+	userID, ok := auth.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "unauthorized"}})
+		return
+	}
+	_, githubLogin, _, _, err := s.services.Auth.GetUserByID(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"code": "UNAUTHORIZED", "message": "could not load the signed-in GitHub user"}})
+		return
+	}
+	repos, err := s.services.GitHub.ListRegistrableRepos(c.Request.Context(), githubLogin)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to list registrable repositories")
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "GITHUB_ERROR", "message": "could not list your GitHub repositories"}})
+		return
+	}
+	installURL := ""
+	if slug := strings.TrimSpace(s.cfg.GitHubAppSlug); slug != "" {
+		installURL = "https://github.com/apps/" + slug + "/installations/new"
+	}
+	items := make([]gin.H, 0, len(repos))
+	for _, repo := range repos {
+		items = append(items, gin.H{"installation_id": repo.InstallationID, "full_name": repo.FullName, "private": repo.Private})
+	}
+	c.JSON(http.StatusOK, gin.H{"install_url": installURL, "repositories": items})
 }
 
 func (s *Server) handleCreateProject(c *gin.Context) {
