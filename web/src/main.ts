@@ -202,9 +202,15 @@ function showProjectForm(user: User) {
         return
       }
       if (!response.ok) throw new Error(result.error?.message ?? 'We could not register that repository. Check the name and installation ID.')
-      message.innerHTML = `${escapeHtml(result.repo_full_name ?? 'Repository')} is registered. ${result.id ? `<a href="/dashboard/${result.id}?repo=${encodeURIComponent(result.repo_full_name ?? '')}">Open project dashboard →</a>` : 'You’re ready for the next step.'}`
       message.className = 'register-message is-success'
       projectForm.reset()
+      if (result.id) {
+        const dashboardURL = `/dashboard/${result.id}?repo=${encodeURIComponent(result.repo_full_name ?? '')}`
+        message.textContent = `${result.repo_full_name ?? 'Repository'} is registered. Taking you to the dashboard…`
+        window.setTimeout(() => { window.location.href = dashboardURL }, 1200)
+      } else {
+        message.textContent = `${result.repo_full_name ?? 'Repository'} is registered. You’re ready for the next step.`
+      }
     } catch (error) {
       message.textContent = error instanceof Error ? error.message : 'Registration failed. Please try again.'
       message.className = 'register-message is-error'
