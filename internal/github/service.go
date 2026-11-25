@@ -42,6 +42,9 @@ type Service struct {
 	// newInstallationClient builds per-installation API clients. Tests
 	// override it with a factory pointed at a mock server.
 	newInstallationClient func(installationID int64) (*github.Client, error)
+	// newAppClient builds the app-level (JWT) API client used to list
+	// installations. Tests override it the same way.
+	newAppClient func() (*github.Client, error)
 }
 
 type Config struct {
@@ -61,6 +64,7 @@ func NewService(cfg interface{}, pool *pgxpool.Pool) *Service {
 		log:  logger,
 	}
 	svc.newInstallationClient = svc.GetInstallationClient
+	svc.newAppClient = svc.GetAppClient
 	return svc
 }
 
@@ -78,6 +82,22 @@ func (s *Service) SetNotifier(n *notify.Service) {
 // construction (used by tests with a mock GitHub server).
 func (s *Service) SetInstallationClientFactory(f func(int64) (*github.Client, error)) {
 	s.newInstallationClient = f
+}
+
+// SetAppClientFactory overrides app-level API client construction (used by
+// tests with a mock GitHub server).
+func (s *Service) SetAppClientFactory(f func() (*github.Client, error)) {
+	s.newAppClient = f
+}
+
+// GetAppClient returns an app-level client authenticated as the GitHub App
+// itself (JWT), for operations above any single installation.
+func (s *Service) GetAppClient() (*github.Client, error) {
+	atr, err := ghinstallation.NewAppsTransportKeyFromFile(http.DefaultTransport, s.cfg.AppID, s.cfg.PrivateKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	return github.NewClient(&http.Client{Transport: atr}), nil
 }
 
 func (s *Service) Connect(ctx context.Context) error {
@@ -569,6 +589,69 @@ func (s *Service) ListAdminRepos(ctx context.Context, installationID int64, gith
 			break
 		}
 		opts.Page = resp.NextPage
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FullName < out[j].FullName })
+	return out, nil
+}
+
+// InstallationInfo identifies one account the App is installed on.
+type InstallationInfo struct {
+	ID           int64
+	AccountLogin string
+}
+
+// ListInstallations returns every account-level installation of the App.
+func (s *Service) ListInstallations(ctx context.Context) ([]InstallationInfo, error) {
+	client, err := s.newAppClient()
+	if err != nil {
+		return nil, err
+	}
+	installations, _, err := client.Apps.ListInstallations(ctx, &github.ListOptions{PerPage: 100})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]InstallationInfo, 0, len(installations))
+	for _, installation := range installations {
+		out = append(out, InstallationInfo{ID: installation.GetID(), AccountLogin: installation.GetAccount().GetLogin()})
+	}
+	return out, nil
+}
+
+// RegistrableRepo is one repository the registration picker can offer,
+// already paired with the installation that serves it.
+type RegistrableRepo struct {
+	InstallationID int64
+	FullName       string
+	Private        bool
+}
+
+// maxPickerInstallations caps the registration picker: each installation
+// costs a repo listing plus per-repo permission checks.
+const maxPickerInstallations = 10
+
+// ListRegistrableRepos returns every repository the given user can register
+// across all installations of the App, sorted by full name: admin-only,
+// since registration requires repo admin.
+func (s *Service) ListRegistrableRepos(ctx context.Context, githubLogin string) ([]RegistrableRepo, error) {
+	installations, err := s.ListInstallations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []RegistrableRepo
+	for i, installation := range installations {
+		if i >= maxPickerInstallations {
+			break
+		}
+		repos, err := s.ListAdminRepos(ctx, installation.ID, githubLogin)
+		if err != nil {
+			return nil, err
+		}
+		for _, repo := range repos {
+			out = append(out, RegistrableRepo{InstallationID: installation.ID, FullName: repo.FullName, Private: repo.Private})
+			if len(out) >= maxListRepos {
+				return out, nil
+			}
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].FullName < out[j].FullName })
 	return out, nil

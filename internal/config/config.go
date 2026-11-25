@@ -24,6 +24,7 @@ type Config struct {
 	PayoutMaxFeeFloorSats        int    `mapstructure:"PAYOUT_MAX_FEE_FLOOR_SATS"`
 	PayoutMergeGraceMinutes      int    `mapstructure:"PAYOUT_MERGE_GRACE_MINUTES"`
 	GitHubAppID                  string `mapstructure:"GITHUB_APP_ID"`
+	GitHubAppSlug                string `mapstructure:"GITHUB_APP_SLUG"`
 	GitHubAppPrivateKeyPath      string `mapstructure:"GITHUB_APP_PRIVATE_KEY_PATH"`
 	GitHubWebhookSecret          string `mapstructure:"GITHUB_WEBHOOK_SECRET"`
 	GitHubOAuthClientID          string `mapstructure:"GITHUB_OAUTH_CLIENT_ID"`
@@ -64,7 +65,7 @@ func Load() (*Config, error) {
 	for _, key := range []string{
 		"APP_ENV", "NETWORK", "HTTP_ADDR", "BASE_URL", "WEB_URL", "DATABASE_URL",
 		"LND_HOST", "LND_TLS_CERT", "LND_INVOICE_MACAROON", "LND_PAYMENT_MACAROON",
-		"PAYOUT_MAX_FEE_PPM", "PAYOUT_MAX_FEE_FLOOR_SATS", "PAYOUT_MERGE_GRACE_MINUTES", "GITHUB_APP_ID",
+		"PAYOUT_MAX_FEE_PPM", "PAYOUT_MAX_FEE_FLOOR_SATS", "PAYOUT_MERGE_GRACE_MINUTES", "GITHUB_APP_ID", "GITHUB_APP_SLUG",
 		"GITHUB_APP_PRIVATE_KEY_PATH", "GITHUB_WEBHOOK_SECRET", "GITHUB_OAUTH_CLIENT_ID",
 		"GITHUB_OAUTH_CLIENT_SECRET", "PLATFORM_FEE_BPS", "BOUNTY_DEFAULT_EXPIRY_DAYS",
 		"CLAIM_EXPIRY_DAYS", "CLAIM_LINK_EXPIRY_DAYS", "PAYOUTS_PAUSED", "MIN_REWARD_SATS", "SESSION_SECRET",

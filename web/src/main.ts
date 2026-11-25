@@ -128,51 +128,61 @@ function showProjectForm(user: User) {
 
   const projectForm = registerCard.querySelector<HTMLFormElement>('#project-form')!
   const message = registerCard.querySelector<HTMLParagraphElement>('#project-message')!
+  const repoInput = registerCard.querySelector<HTMLInputElement>('#repo-name')!
   const installInput = registerCard.querySelector<HTMLInputElement>('#installation-id')!
   const suggestions = registerCard.querySelector<HTMLDataListElement>('#repo-suggestions')!
   const hint = registerCard.querySelector<HTMLParagraphElement>('.register-hint')!
-  const hintText = hint.textContent
 
-  // Suggest the installation's admin repositories as the ID is typed. Best
-  // effort: failures and unknown IDs leave manual entry untouched.
-  let suggestTimer = 0
-  let suggestSeq = 0
-  installInput.addEventListener('input', () => {
-    window.clearTimeout(suggestTimer)
-    const id = Number(installInput.value)
-    if (!Number.isInteger(id) || id <= 0) {
-      suggestions.replaceChildren()
-      hint.textContent = hintText
-      return
-    }
-    suggestTimer = window.setTimeout(async () => {
-      const seq = ++suggestSeq
-      hint.textContent = 'Loading your repositories…'
-      try {
-        const response = await fetch(`/api/v1/github/installations/${id}/repositories`)
-        if (seq !== suggestSeq) return
-        if (!response.ok) throw new Error()
-        const data = await response.json() as { repositories?: { full_name: string; private: boolean }[] }
-        const repos = data.repositories ?? []
-        suggestions.replaceChildren()
-        if (repos.length === 0) {
-          hint.textContent = 'No repositories found for that installation ID — check the number, or type owner/repository manually.'
-          return
-        }
-        for (const repo of repos) {
-          const option = document.createElement('option')
-          option.value = repo.full_name
-          option.label = repo.private ? `${repo.full_name} (private)` : repo.full_name
-          suggestions.appendChild(option)
-        }
-        hint.textContent = `Pick one of your ${repos.length} ${repos.length === 1 ? 'repository' : 'repositories'} above, or type owner/repository manually.`
-      } catch {
-        if (seq !== suggestSeq) return
-        suggestions.replaceChildren()
-        hint.textContent = hintText
+  // Offer every repository the signer can register, pairing each with its
+  // installation so picking one fills the ID in. Best effort: failures
+  // leave manual entry untouched.
+  const installForRepo = new Map<string, number>()
+  const installLink = (url: string) => {
+    hint.innerHTML = ''
+    const text = document.createElement('span')
+    text.textContent = 'No repositories found — install the Satlight GitHub App first, then come back here. '
+    const link = document.createElement('a')
+    link.href = url
+    link.target = '_blank'
+    link.rel = 'noopener'
+    link.textContent = 'Install the App ↗'
+    hint.append(text, link)
+  }
+  const loadRepos = async () => {
+    hint.textContent = 'Loading your repositories…'
+    try {
+      const response = await fetch('/api/v1/github/registrable-repositories')
+      if (response.status === 401) {
+        showSignIn('Your session expired. Sign in again to register the repository.')
+        return
       }
-    }, 600)
+      if (!response.ok) throw new Error()
+      const data = await response.json() as { install_url?: string; repositories?: { installation_id: number; full_name: string; private: boolean }[] }
+      const repos = data.repositories ?? []
+      suggestions.replaceChildren()
+      installForRepo.clear()
+      if (repos.length === 0) {
+        if (data.install_url) installLink(data.install_url)
+        else hint.textContent = 'No repositories found — install the Satlight GitHub App on a repository first, then reload this page.'
+        return
+      }
+      for (const repo of repos) {
+        installForRepo.set(repo.full_name, repo.installation_id)
+        const option = document.createElement('option')
+        option.value = repo.full_name
+        option.label = repo.private ? `${repo.full_name} (private)` : repo.full_name
+        suggestions.appendChild(option)
+      }
+      hint.textContent = `Pick one of your ${repos.length} ${repos.length === 1 ? 'repository' : 'repositories'} from the list, or type owner/repository manually.`
+    } catch {
+      hint.textContent = 'Could not load your repositories — type owner/repository and the installation ID manually.'
+    }
+  }
+  repoInput.addEventListener('input', () => {
+    const id = installForRepo.get(repoInput.value.trim())
+    if (id !== undefined) installInput.value = String(id)
   })
+  void loadRepos()
   projectForm.addEventListener('submit', async (event) => {
     event.preventDefault()
     const button = projectForm.querySelector<HTMLButtonElement>('button')!

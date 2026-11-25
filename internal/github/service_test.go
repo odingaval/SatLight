@@ -142,6 +142,52 @@ func TestListAdminRepos(t *testing.T) {
 	}
 }
 
+func TestListRegistrableRepos(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/app/installations":
+			_, _ = w.Write([]byte(`[{"id":11,"account":{"login":"octo"}},{"id":22,"account":{"login":"acme"}}]`))
+		case "/installation/repositories":
+			_, _ = w.Write([]byte(`{"total_count":1,"repositories":[{"full_name":"octo/app","private":true}]}`))
+		case "/repos/octo/app/collaborators/maintainer/permission":
+			_, _ = w.Write([]byte(`{"permission":"admin"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	service := NewService(&Config{}, nil)
+	mockClient := func() (*github.Client, error) {
+		client := github.NewClient(nil)
+		base, err := url.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.BaseURL = base
+		client.UploadURL = base
+		return client, nil
+	}
+	service.SetAppClientFactory(mockClient)
+	service.SetInstallationClientFactory(func(int64) (*github.Client, error) { return mockClient() })
+
+	installations, err := service.ListInstallations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installations) != 2 || installations[0].ID != 11 || installations[1].AccountLogin != "acme" {
+		t.Fatalf("ListInstallations() = %+v, want IDs 11 and 22", installations)
+	}
+	repos, err := service.ListRegistrableRepos(context.Background(), "maintainer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 2 || repos[0].InstallationID != 11 || repos[1].InstallationID != 22 {
+		t.Fatalf("ListRegistrableRepos() = %+v, want octo/app paired with installations 11 and 22", repos)
+	}
+}
+
 func TestListAdminReposPropagatesListErrors(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)

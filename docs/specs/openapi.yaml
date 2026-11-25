@@ -240,13 +240,26 @@ paths:
         '200': { description: Notification settings updated }
         '400': { description: Invalid webhook URL }
         '403': { description: Only the project owner can configure notifications }
-  /github/installations/{installationId}/repositories:
+  /github/registrable-repositories:
     get:
-      summary: Repositories the signer admins on one App installation (registration picker)
-      parameters: [ { name: installationId, in: path, required: true, schema: { type: integer } } ]
+      summary: Repositories the signer can register across App installations (registration picker)
       responses:
-        '200': { description: Admin repositories sorted by full name, content: { application/json: { schema: { type: object, properties: { repositories: { type: array, items: { type: object, properties: { full_name: { type: string }, private: { type: boolean } } } } } } } } }
-        '400': { description: Invalid installation ID }
+        '200':
+          description: Admin repositories with installation IDs plus the App install URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  install_url: { type: string }
+                  repositories:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        installation_id: { type: integer }
+                        full_name: { type: string }
+                        private: { type: boolean }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '502': { description: GitHub API error }
   /webhooks/github:
